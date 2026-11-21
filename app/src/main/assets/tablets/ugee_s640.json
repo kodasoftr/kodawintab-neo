@@ -1,0 +1,35 @@
+{
+  "id": "ugee_s640",
+  "name": "Ugee S640",
+  "brand": "Ugee",
+  "vendorId": 10429,
+  "productIds": [2323, 2324, 2335],
+  "widthMm": 160.02,
+  "heightMm": 100.01,
+  "maxX": 32767,
+  "maxY": 32767,
+  "maxPressure": 8191,
+  "lpi": 5080,
+  "pollingRateHz": 250,
+  "interfaceNumber": 2,
+  "endpointAddress": 131,
+  "parserType": "UGEE_S640",
+  "initControlTransfers": [
+    {
+      "requestType": 33,
+      "request": 9,
+      "value": 514,
+      "index": 2,
+      "dataHex": "02B0040000000000"
+    },
+    {
+      "requestType": 33,
+      "request": 9,
+      "value": 514,
+      "index": 0,
+      "dataHex": "02B0040000000000"
+    }
+  ],
+  "expressKeysCount": 10,
+  "supportsTilt": true
+}

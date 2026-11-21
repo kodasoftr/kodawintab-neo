@@ -1,0 +1,28 @@
+{
+  "id": "wacom_intuos",
+  "name": "Wacom Intuos / One",
+  "brand": "Wacom",
+  "vendorId": 1386,
+  "productIds": [884, 890, 827, 891],
+  "widthMm": 152.0,
+  "heightMm": 95.0,
+  "maxX": 15200,
+  "maxY": 9500,
+  "maxPressure": 4095,
+  "lpi": 2540,
+  "pollingRateHz": 133,
+  "interfaceNumber": 0,
+  "endpointAddress": 129,
+  "parserType": "WACOM",
+  "initControlTransfers": [
+    {
+      "requestType": 33,
+      "request": 9,
+      "value": 770,
+      "index": 0,
+      "dataHex": "0202"
+    }
+  ],
+  "expressKeysCount": 4,
+  "supportsTilt": false
+}

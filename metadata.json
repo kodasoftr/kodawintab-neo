@@ -1,0 +1,6 @@
+{
+  "name": "Koda Wintab",
+  "description": "Driver global nativo de alta precisão para mesas digitalizadoras (Wacom, Huion, Ugee, XP-Pen) e hub multi-dispositivo USB com Koda Engine via ADB.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

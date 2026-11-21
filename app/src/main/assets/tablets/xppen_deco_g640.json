@@ -1,0 +1,28 @@
+{
+  "id": "xppen_deco_g640",
+  "name": "XP-Pen Star G640 / Deco",
+  "brand": "XP-Pen",
+  "vendorId": 10429,
+  "productIds": [117, 2309, 2331, 2325],
+  "widthMm": 152.4,
+  "heightMm": 101.6,
+  "maxX": 32767,
+  "maxY": 32767,
+  "maxPressure": 8191,
+  "lpi": 5080,
+  "pollingRateHz": 266,
+  "interfaceNumber": 2,
+  "endpointAddress": 131,
+  "parserType": "XP_PEN",
+  "initControlTransfers": [
+    {
+      "requestType": 33,
+      "request": 9,
+      "value": 514,
+      "index": 2,
+      "dataHex": "02B0040000000000"
+    }
+  ],
+  "expressKeysCount": 8,
+  "supportsTilt": true
+}

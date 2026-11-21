@@ -1,0 +1,20 @@
+{
+  "id": "huion_h640p",
+  "name": "Huion Inspiroy / H640P",
+  "brand": "Huion",
+  "vendorId": 9580,
+  "productIds": [109, 110, 100, 111],
+  "widthMm": 160.0,
+  "heightMm": 100.0,
+  "maxX": 32000,
+  "maxY": 20000,
+  "maxPressure": 8191,
+  "lpi": 5080,
+  "pollingRateHz": 233,
+  "interfaceNumber": 0,
+  "endpointAddress": 129,
+  "parserType": "HUION",
+  "initControlTransfers": [],
+  "expressKeysCount": 6,
+  "supportsTilt": true
+}

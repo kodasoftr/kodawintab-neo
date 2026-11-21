@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Apenas Mesas Digitalizadoras e Digitisers (ADB, Armazenamento USB, Hubs, Teclados e MTP ficam 100% livres no sistema) -->
+    <!-- Ugee / XP-Pen / Hanvon (VID 0x28BD = 10429) -->
+    <usb-device vendor-id="10429" />
+    <!-- Wacom (VID 0x056A = 1386) -->
+    <usb-device vendor-id="1386" />
+    <!-- Huion / UC-Logic / Gaomon (VID 0x256C = 9580) -->
+    <usb-device vendor-id="9580" />
+    <!-- Veikk (VID 0x2FEB = 12267) -->
+    <usb-device vendor-id="12267" />
+    <!-- Parblo / Yiynova (VID 0x2179 = 8569) -->
+    <usb-device vendor-id="8569" />
+    <!-- Waltop (VID 0x172F = 5935) -->
+    <usb-device vendor-id="5935" />
+    <!-- Digitizer HID dedicado (subclass=0, protocol=0) — não intercepta boot mouse (protocol=2) nem boot teclado (protocol=1) nem ADB -->
+    <usb-device class="3" subclass="0" protocol="0" />
+</resources>

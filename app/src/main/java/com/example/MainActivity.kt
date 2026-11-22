@@ -172,6 +172,7 @@ fun KodaWintabRoot(
     val hexFrames by viewModel.hexFrames.collectAsStateWithLifecycle()
     val statusToast by viewModel.statusToast.collectAsStateWithLifecycle()
     val cursorSnapshot by viewModel.cursorSnapshot.collectAsStateWithLifecycle()
+    val hubPowerTelemetry by viewModel.hubPowerTelemetry.collectAsStateWithLifecycle()
 
     val notifPermissionLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.RequestPermission()
@@ -185,6 +186,7 @@ fun KodaWintabRoot(
         val obs = LifecycleEventObserver { _, event ->
             if (event == Lifecycle.Event.ON_RESUME) {
                 viewModel.refreshOverlayPermission()
+                viewModel.refreshPowerTelemetry()
             }
         }
         lifecycleOwner.lifecycle.addObserver(obs)
@@ -312,11 +314,14 @@ fun KodaWintabRoot(
                     engineState = engineState,
                     overlayGranted = cursorSnapshot.overlayPermissionGranted,
                     usbDeviceCount = usbDevices.size,
+                    hubPowerTelemetry = hubPowerTelemetry,
                     onBack = { navController.popBackStack() },
                     onSilentReconnect = {
                         viewModel.silentPollEngineConnection()
                         viewModel.refreshOverlayPermission()
+                        viewModel.refreshPowerTelemetry()
                     },
+                    onApplyHubMode = { viewModel.selectHubOperationMode(it) },
                     onGrantOverlayViaAdb = { viewModel.grantOverlayViaAdb() },
                     onOpenOverlaySettings = {
                         runCatching {
@@ -373,9 +378,12 @@ fun KodaWintabRoot(
                     coopEvent = coopEvent,
                     simulatedClosedPackages = simulatedClosedPackages,
                     cursorSnapshot = cursorSnapshot,
+                    hubPowerTelemetry = hubPowerTelemetry,
                     engineActive = engineState.isActive,
                     onBack = { navController.popBackStack() },
                     onRefreshDevices = { viewModel.refreshUsbAndDisplays() },
+                    onSelectHubMode = { viewModel.selectHubOperationMode(it) },
+                    onRefreshPowerTelemetry = { viewModel.refreshPowerTelemetry() },
                     onRequestUsbPermission = { viewModel.requestUsbPermission(it) },
                     onAssignPhysicalDevice = { slot, key, name -> viewModel.assignHubDevice(slot, key, name) },
                     onAssignCombinedDevices = { slot, k1, n1, k2, n2 ->

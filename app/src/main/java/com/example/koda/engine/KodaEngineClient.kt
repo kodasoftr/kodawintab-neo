@@ -65,6 +65,15 @@ data class StylusSample(
     val buttonState: Int
 )
 
+data class UsbPortPowerResult(
+    val applied: Boolean,
+    val portId: String,
+    val powerRole: String,
+    val dataRole: String,
+    val supportsDualRole: Boolean,
+    val detail: String
+)
+
 /**
  * App-side IPC client for Koda Engine over 127.0.0.1 TCP loopback.
  * Token-free ADB bootstrap command works cleanly on Windows CMD, PowerShell, Linux, macOS,
@@ -505,6 +514,54 @@ class KodaEngineClient(private val context: Context) {
                     pressureNorm = inp.readFloat(),
                     isStylus = inp.readBoolean(),
                     isVisible = inp.readBoolean()
+                )
+            } catch (_: Throwable) {
+                null
+            }
+        }
+    }
+
+    fun applyHubPrivilegeMode(modeCode: Int): UsbPortPowerResult? {
+        if (!_state.value.isActive) return null
+        synchronized(ioLock) {
+            val out = output ?: return null
+            val inp = input ?: return null
+            return try {
+                out.writeByte(KodaEngineProtocol.CMD_APPLY_HUB_MODE.toInt())
+                out.writeInt(modeCode)
+                out.writeUTF(context.packageName)
+                out.flush()
+                if (inp.readByte() != KodaEngineProtocol.STATUS_OK) return null
+                UsbPortPowerResult(
+                    applied = inp.readBoolean(),
+                    portId = inp.readUTF(),
+                    powerRole = inp.readUTF(),
+                    dataRole = inp.readUTF(),
+                    supportsDualRole = inp.readBoolean(),
+                    detail = inp.readUTF()
+                )
+            } catch (_: Throwable) {
+                null
+            }
+        }
+    }
+
+    fun queryUsbPortPower(): UsbPortPowerResult? {
+        if (!_state.value.isActive) return null
+        synchronized(ioLock) {
+            val out = output ?: return null
+            val inp = input ?: return null
+            return try {
+                out.writeByte(KodaEngineProtocol.CMD_QUERY_USB_POWER.toInt())
+                out.flush()
+                if (inp.readByte() != KodaEngineProtocol.STATUS_OK) return null
+                UsbPortPowerResult(
+                    applied = true,
+                    portId = inp.readUTF(),
+                    powerRole = inp.readUTF(),
+                    dataRole = inp.readUTF(),
+                    supportsDualRole = inp.readBoolean(),
+                    detail = inp.readUTF()
                 )
             } catch (_: Throwable) {
                 null

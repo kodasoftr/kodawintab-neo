@@ -21,6 +21,8 @@ import com.example.hub.CoopBannerEvent
 import com.example.hub.CursorDecoder
 import com.example.hub.CursorOverlaySnapshot
 import com.example.hub.CursorRenderMode
+import com.example.hub.HubOperationMode
+import com.example.hub.HubPowerTelemetry
 import com.example.hub.HubSlotAssignment
 import com.example.hub.HubSlotId
 import com.example.hub.InstalledAppEntry
@@ -56,6 +58,7 @@ class KodaViewModel(application: Application) : AndroidViewModel(application) {
     val coopEvent: StateFlow<CoopBannerEvent?> = hubManager.coopEvent
     val simulatedClosedPackages: StateFlow<Set<String>> = hubManager.simulatedClosedPackages
     val cursorSnapshot: StateFlow<CursorOverlaySnapshot> = cursorOverlayManager.snapshot
+    val hubPowerTelemetry: StateFlow<HubPowerTelemetry> = hubManager.powerTelemetry
 
     private val _selectedSlot = MutableStateFlow(TabletSlotId.GLOBAL)
     val selectedSlot: StateFlow<TabletSlotId> = _selectedSlot.asStateFlow()
@@ -109,6 +112,13 @@ class KodaViewModel(application: Application) : AndroidViewModel(application) {
             if (connState.isActive) {
                 cursorOverlayManager.setPaused(false)
                 startHubServiceSafely()
+                withContext(Dispatchers.IO) {
+                    runCatching { app.syncNativeCursorWithEngine() }
+                    runCatching { hubManager.syncModeWithEngineIfNeeded() }
+                }
+                runCatching { usbCoordinator.refreshConnectedDevices() }
+            } else {
+                hubManager.refreshPowerTelemetry()
             }
             cursorOverlayManager.refreshOverlayPermission()
         }
@@ -135,6 +145,12 @@ class KodaViewModel(application: Application) : AndroidViewModel(application) {
             val res = engineClient.verifyConnection()
             if (res.isActive) {
                 startHubServiceSafely()
+                cursorOverlayManager.refreshOverlayPermission()
+                withContext(Dispatchers.IO) {
+                    runCatching { app.syncNativeCursorWithEngine() }
+                    runCatching { hubManager.syncModeWithEngineIfNeeded() }
+                }
+                usbCoordinator.refreshConnectedDevices()
                 _errorPopup.value = null
             } else if (showErrorPopupOnFail) {
                 _errorPopup.value = AppErrorReport(
@@ -152,6 +168,12 @@ class KodaViewModel(application: Application) : AndroidViewModel(application) {
             val res = engineClient.verifyConnection()
             if (res.isActive) {
                 startHubServiceSafely()
+                cursorOverlayManager.refreshOverlayPermission()
+                withContext(Dispatchers.IO) {
+                    runCatching { app.syncNativeCursorWithEngine() }
+                    runCatching { hubManager.syncModeWithEngineIfNeeded() }
+                }
+                usbCoordinator.refreshConnectedDevices()
             }
         }
     }
@@ -411,6 +433,24 @@ class KodaViewModel(application: Application) : AndroidViewModel(application) {
         cursorOverlayManager.refreshOverlayPermission()
         viewModelScope.launch(Dispatchers.IO) {
             runCatching { hubManager.loadLaunchableApps() }
+            runCatching { hubManager.syncModeWithEngineIfNeeded() }
+        }
+    }
+
+    fun selectHubOperationMode(mode: HubOperationMode) {
+        viewModelScope.launch {
+            val telemetry = withContext(Dispatchers.IO) {
+                hubManager.selectHubOperationMode(mode)
+            }
+            usbCoordinator.hubOperationMode = mode
+            usbCoordinator.refreshConnectedDevices()
+            _statusToast.value = "${mode.title}: ${telemetry.statusDetail}"
+        }
+    }
+
+    fun refreshPowerTelemetry() {
+        viewModelScope.launch(Dispatchers.IO) {
+            hubManager.syncModeWithEngineIfNeeded()
         }
     }
 

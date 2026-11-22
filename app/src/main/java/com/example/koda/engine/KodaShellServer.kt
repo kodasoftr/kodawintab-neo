@@ -41,7 +41,7 @@ import kotlin.math.hypot
 object KodaShellServer {
 
     private var allowedPackage: String = ""
-    private val startTimeMs = SystemClock.elapsedRealtime()
+    private var startTimeMs = 0L
     @Volatile private var keepRunning = true
     @Volatile private var serverSocket: ServerSocket? = null
 
@@ -91,6 +91,7 @@ object KodaShellServer {
     private fun runDaemonLauncher() {
         // Gracefully replace any stale server holding the port
         requestExistingShutdown()
+        disablePhantomProcessRestriction()
 
         val classpath = System.getenv("CLASSPATH")
             ?: System.getProperty("java.class.path")
@@ -103,59 +104,110 @@ object KodaShellServer {
 
         val pkgFlag = if (allowedPackage.isNotBlank()) " --pkg=$allowedPackage" else ""
         val appProcessCmd = "/system/bin/app_process /system/bin com.example.koda.engine.KodaShellServer --child$pkgFlag"
-        val launcherPrefix = if (File("/system/bin/setsid").exists()) "/system/bin/setsid " else ""
+        val hasSetsid = File("/system/bin/setsid").exists()
+        val hasNohup = File("/system/bin/nohup").exists()
+        val setsidPrefix = if (hasSetsid) "/system/bin/setsid " else ""
+        val nohupPrefix = if (hasNohup) "/system/bin/nohup " else ""
+        val logPath = "/data/local/tmp/koda_daemon.log"
+        val escapedCp = classpath.replace("'", "'\\''")
 
-        // Double-fork inside sh with HUP/TERM/PIPE trapped so grandchild is immediately
-        // reparented to PID 1 (init), detached from adbd pty/cgroup when PC unplugs or
-        // USB Debugging is toggled off.
-        var launched = false
-        try {
-            val doubleForkCmd = "trap '' HUP TERM PIPE; ( ${launcherPrefix}CLASSPATH=$classpath $appProcessCmd </dev/null >/dev/null 2>&1 & )"
-            ProcessBuilder("/system/bin/sh", "-c", doubleForkCmd)
-                .redirectInput(ProcessBuilder.Redirect.from(File("/dev/null")))
-                .redirectOutput(ProcessBuilder.Redirect.to(File("/dev/null")))
-                .redirectError(ProcessBuilder.Redirect.to(File("/dev/null")))
-                .start()
-            launched = true
-        } catch (_: Throwable) {
-            launched = false
+        // Launch Strategy A: export CLASSPATH *before* nohup/setsid (fixes Toybox setsid treating
+        // `CLASSPATH=...` as executable name) + trap SIGHUP/SIGTERM/SIGPIPE + log output for diagnostics.
+        val shellLaunchOk = runCatching {
+            val doubleForkCmd =
+                "trap '' HUP TERM PIPE; export CLASSPATH='$escapedCp'; " +
+                    "( $nohupPrefix$setsidPrefix$appProcessCmd </dev/null >$logPath 2>&1 & )"
+            ProcessBuilder("/system/bin/sh", "-c", doubleForkCmd).apply {
+                environment()["CLASSPATH"] = classpath
+                redirectInput(ProcessBuilder.Redirect.from(File("/dev/null")))
+                redirectOutput(ProcessBuilder.Redirect.to(File("/dev/null")))
+                redirectError(ProcessBuilder.Redirect.to(File("/dev/null")))
+            }.start()
+            true
+        }.getOrDefault(false)
+
+        var ready = false
+        val firstDeadline = System.currentTimeMillis() + 2000L
+        if (shellLaunchOk) {
+            while (System.currentTimeMillis() < firstDeadline) {
+                if (probeServerAlive()) {
+                    Thread.sleep(220L)
+                    if (probeServerAlive()) {
+                        ready = true
+                        break
+                    }
+                }
+                Thread.sleep(100L)
+            }
         }
 
-        if (!launched) {
+        // Launch Strategy B fallback: direct setsid/app_process spawn with explicit environment CLASSPATH
+        if (!ready) {
             val childArgs = buildList {
-                if (File("/system/bin/setsid").exists()) add("/system/bin/setsid")
+                if (hasSetsid) add("/system/bin/setsid")
                 add("/system/bin/app_process")
                 add("/system/bin")
                 add("com.example.koda.engine.KodaShellServer")
                 add("--child")
                 if (allowedPackage.isNotBlank()) add("--pkg=$allowedPackage")
             }
-            try {
-                val pb = ProcessBuilder(childArgs)
-                pb.environment()["CLASSPATH"] = classpath
-                pb.redirectInput(ProcessBuilder.Redirect.from(File("/dev/null")))
-                pb.redirectOutput(ProcessBuilder.Redirect.to(File("/dev/null")))
-                pb.redirectError(ProcessBuilder.Redirect.to(File("/dev/null")))
-                pb.start()
-            } catch (t2: Throwable) {
+            runCatching {
+                ProcessBuilder(childArgs).apply {
+                    environment()["CLASSPATH"] = classpath
+                    redirectInput(ProcessBuilder.Redirect.from(File("/dev/null")))
+                    redirectOutput(ProcessBuilder.Redirect.to(File(logPath)))
+                    redirectError(ProcessBuilder.Redirect.to(File(logPath)))
+                }.start()
+            }.onFailure { t2 ->
                 System.err.println("adb command failed: ${t2.message}")
                 kotlin.system.exitProcess(1)
+                return
+            }
+
+            val secondDeadline = System.currentTimeMillis() + 2600L
+            while (System.currentTimeMillis() < secondDeadline) {
+                if (probeServerAlive()) {
+                    Thread.sleep(220L)
+                    if (probeServerAlive()) {
+                        ready = true
+                        break
+                    }
+                }
+                Thread.sleep(100L)
             }
         }
 
-        // Wait up to 4.0 seconds for the child server to bind 127.0.0.1:47291 and verify readiness
-        val deadline = System.currentTimeMillis() + 4000L
-        while (System.currentTimeMillis() < deadline) {
-            if (probeServerAlive()) {
-                println("adb command success (Koda Wintab UID=${Process.myUid()} · Privilégios permanentes aplicados)")
-                System.out.flush()
-                kotlin.system.exitProcess(0)
-            }
-            Thread.sleep(100L)
+        if (ready) {
+            println("adb command success (Koda Wintab Daemon UID=${Process.myUid()} · Privilégios permanentes aplicados)")
+            System.out.flush()
+            kotlin.system.exitProcess(0)
+            return
         }
 
-        System.err.println("adb command failed: servidor nao respondeu na porta ${KodaEngineProtocol.SERVER_PORT}")
+        val logHint = runCatching {
+            val f = File(logPath)
+            if (f.exists()) f.readLines().takeLast(3).joinToString(" | ") else ""
+        }.getOrDefault("")
+        val detail = if (logHint.isNotBlank()) " [$logHint]" else ""
+        System.err.println("adb command failed: daemon nao respondeu na porta ${KodaEngineProtocol.SERVER_PORT}$detail")
         kotlin.system.exitProcess(1)
+    }
+
+    private fun disablePhantomProcessRestriction() {
+        val cmds = listOf(
+            arrayOf("/system/bin/device_config", "put", "activity_manager", "max_phantom_processes", "2147483647"),
+            arrayOf("/system/bin/device_config", "set_sync_disabled_for_tests", "persistent"),
+            arrayOf("/system/bin/settings", "put", "global", "settings_enable_monitor_phantom_procs", "false")
+        )
+        for (cmd in cmds) {
+            runCatching {
+                ProcessBuilder(*cmd)
+                    .redirectInput(ProcessBuilder.Redirect.from(File("/dev/null")))
+                    .redirectErrorStream(true)
+                    .start()
+                    .waitFor()
+            }
+        }
     }
 
     private fun installDaemonSignalImmunity() {
@@ -179,6 +231,7 @@ object KodaShellServer {
     }
 
     private fun runServerLoop() {
+        startTimeMs = SystemClock.elapsedRealtime()
         installDaemonSignalImmunity()
         if (Looper.getMainLooper() == null) {
             @Suppress("DEPRECATION")
@@ -242,21 +295,27 @@ object KodaShellServer {
     }
 
     private fun grantPermanentAppPrivileges(pkg: String) {
+        disablePhantomProcessRestriction()
         if (pkg.isBlank()) return
         val commands = listOf(
             arrayOf("appops", "set", pkg, "SYSTEM_ALERT_WINDOW", "allow"),
+            arrayOf("appops", "set", pkg, "ACCESS_RESTRICTED_SETTINGS", "allow"),
             arrayOf("appops", "set", pkg, "GET_USAGE_STATS", "allow"),
             arrayOf("appops", "set", pkg, "RUN_IN_BACKGROUND", "allow"),
             arrayOf("appops", "set", pkg, "RUN_ANY_IN_BACKGROUND", "allow"),
             arrayOf("appops", "set", pkg, "START_FOREGROUND", "allow"),
             arrayOf("appops", "set", pkg, "WRITE_SETTINGS", "allow"),
+            arrayOf("appops", "set", pkg, "WAKE_LOCK", "allow"),
+            arrayOf("am", "set-standby-bucket", pkg, "active"),
             arrayOf("cmd", "deviceidle", "whitelist", "+$pkg"),
             arrayOf("dumpsys", "deviceidle", "whitelist", "+$pkg"),
-            arrayOf("pm", "grant", pkg, "android.permission.POST_NOTIFICATIONS")
+            arrayOf("pm", "grant", pkg, "android.permission.POST_NOTIFICATIONS"),
+            arrayOf("settings", "put", "system", "otg_enable", "1")
         )
         for (cmd in commands) {
             runCatching {
                 ProcessBuilder(*cmd)
+                    .redirectInput(ProcessBuilder.Redirect.from(File("/dev/null")))
                     .redirectErrorStream(true)
                     .start()
                     .waitFor()
@@ -264,45 +323,108 @@ object KodaShellServer {
         }
     }
 
+    data class DeviceInputCaps(
+        val devPath: String,
+        val isStylus: Boolean = false,
+        val isMouse: Boolean = false,
+        val isTouchscreenOnly: Boolean = false,
+        val maxX: Float = 32767f,
+        val maxY: Float = 32767f,
+        val maxP: Float = 8191f
+    )
+
+    internal fun parseGeteventLpOutput(output: String): Map<String, DeviceInputCaps> {
+        val result = HashMap<String, DeviceInputCaps>()
+        var currentDev = ""
+        var hasStylus = false
+        var hasMouse = false
+        var hasMtSlot = false
+        var hasInputPropDirect = false
+        var maxX = 32767f
+        var maxY = 32767f
+        var maxP = 8191f
+
+        fun flushCurrent() {
+            if (currentDev.isNotEmpty()) {
+                val touchOnly = (hasMtSlot || hasInputPropDirect) && !hasStylus && !hasMouse
+                result[currentDev] = DeviceInputCaps(
+                    devPath = currentDev,
+                    isStylus = hasStylus,
+                    isMouse = hasMouse,
+                    isTouchscreenOnly = touchOnly,
+                    maxX = maxX.coerceAtLeast(1f),
+                    maxY = maxY.coerceAtLeast(1f),
+                    maxP = maxP.coerceAtLeast(1f)
+                )
+            }
+        }
+
+        for (rawLine in output.lineSequence()) {
+            val line = rawLine.trim()
+            if (line.startsWith("add device")) {
+                flushCurrent()
+                val idx = line.indexOf(':')
+                currentDev = if (idx >= 0) line.substring(idx + 1).trim() else ""
+                hasStylus = false
+                hasMouse = false
+                hasMtSlot = false
+                hasInputPropDirect = false
+                maxX = 32767f
+                maxY = 32767f
+                maxP = 8191f
+                continue
+            }
+            if (currentDev.isEmpty()) continue
+            when {
+                line.contains("BTN_TOOL_PEN") || line.contains("BTN_STYLUS") || line.contains("BTN_TOOL_RUBBER") -> {
+                    hasStylus = true
+                }
+                line.contains("REL_X") || line.contains("REL_Y") || line.contains("BTN_MOUSE") || line.contains("BTN_LEFT") -> {
+                    hasMouse = true
+                }
+                line.contains("ABS_MT_SLOT") || line.contains("ABS_MT_TRACKING_ID") -> {
+                    hasMtSlot = true
+                }
+                line.contains("INPUT_PROP_DIRECT") -> {
+                    hasInputPropDirect = true
+                }
+            }
+            if (line.contains("ABS_X") || line.contains("ABS_MT_POSITION_X")) {
+                extractMaxValue(line)?.let { maxX = it.coerceAtLeast(1f) }
+            } else if (line.contains("ABS_Y") || line.contains("ABS_MT_POSITION_Y")) {
+                extractMaxValue(line)?.let { maxY = it.coerceAtLeast(1f) }
+            } else if (line.contains("ABS_PRESSURE") || line.contains("ABS_MT_PRESSURE")) {
+                extractMaxValue(line)?.let { maxP = it.coerceAtLeast(1f) }
+            }
+        }
+        flushCurrent()
+        return result
+    }
+
+    internal fun parseHexSignedInt(valHex: String): Int? = valHex.toLongOrNull(16)?.toInt()
+
+    private fun refreshGeteventDeviceCaps(target: ConcurrentHashMap<String, DeviceInputCaps>) {
+        runCatching {
+            val probe = ProcessBuilder("/system/bin/getevent", "-lp")
+                .redirectErrorStream(true)
+                .start()
+            val text = probe.inputStream.bufferedReader().readText()
+            probe.waitFor()
+            val parsed = parseGeteventLpOutput(text)
+            target.putAll(parsed)
+        }
+    }
+
     /**
      * Reads Linux input events via `getevent -lp` / `getevent -l` under UID 2000 so
      * mouse moves and tablet magnetic-field stylus hover/press keep moving the global
-     * .cur/.ani/.png cursor across Android Launcher and all third-party apps.
+     * .cur/.ani/.png cursor across Android Launcher and all third-party apps, while
+     * strictly ignoring internal finger touchscreen events.
      */
     private fun startGlobalGeteventMonitor() {
         Thread({
-            val devMaxX = ConcurrentHashMap<String, Float>()
-            val devMaxY = ConcurrentHashMap<String, Float>()
-            val devMaxP = ConcurrentHashMap<String, Float>()
-
-            runCatching {
-                val probe = ProcessBuilder("/system/bin/getevent", "-lp")
-                    .redirectErrorStream(true)
-                    .start()
-                var currentDev = ""
-                BufferedReader(InputStreamReader(probe.inputStream)).use { br ->
-                    while (true) {
-                        val line = br.readLine() ?: break
-                        if (line.startsWith("add device")) {
-                            val idx = line.indexOf(':')
-                            if (idx >= 0) currentDev = line.substring(idx + 1).trim()
-                        } else if (currentDev.isNotEmpty()) {
-                            when {
-                                line.contains("ABS_X") || line.contains("ABS_MT_POSITION_X") -> {
-                                    extractMaxValue(line)?.let { devMaxX[currentDev] = it.coerceAtLeast(1f) }
-                                }
-                                line.contains("ABS_Y") || line.contains("ABS_MT_POSITION_Y") -> {
-                                    extractMaxValue(line)?.let { devMaxY[currentDev] = it.coerceAtLeast(1f) }
-                                }
-                                line.contains("ABS_PRESSURE") || line.contains("ABS_MT_PRESSURE") -> {
-                                    extractMaxValue(line)?.let { devMaxP[currentDev] = it.coerceAtLeast(1f) }
-                                }
-                            }
-                        }
-                    }
-                }
-                probe.waitFor()
-            }
+            val deviceCaps = ConcurrentHashMap<String, DeviceInputCaps>()
+            refreshGeteventDeviceCaps(deviceCaps)
 
             while (keepRunning) {
                 try {
@@ -312,42 +434,51 @@ object KodaShellServer {
                     BufferedReader(InputStreamReader(proc.inputStream)).use { br ->
                         val lastRawX = HashMap<String, Int>()
                         val lastRawY = HashMap<String, Int>()
+                        val liveStylusDevs = HashSet<String>()
                         var pendingRelX = 0f
                         var pendingRelY = 0f
-                        var sawEventInPacket = false
-                        var packetIsStylus = false
-                        var packetIsMouse = false
+                        var packetMouseMoved = false
+                        var packetMouseClicked = false
+                        var packetStylusAbsUpdated = false
                         var packetDev = ""
+                        var lastRescanMs = 0L
 
                         while (keepRunning) {
                             val line = br.readLine() ?: break
+                            if (line.startsWith("add device")) {
+                                refreshGeteventDeviceCaps(deviceCaps)
+                                continue
+                            }
                             if (line.contains("SYN_REPORT")) {
-                                if (sawEventInPacket) {
-                                    if (packetIsMouse && (pendingRelX != 0f || pendingRelY != 0f)) {
+                                if (packetMouseMoved || packetMouseClicked) {
+                                    if (packetMouseMoved) {
                                         synchronized(deltaLock) {
                                             gpPendingDeltaX += pendingRelX
                                             gpPendingDeltaY += pendingRelY
                                         }
-                                        gpHasAbs = false
-                                        gpIsStylus = false
-                                        gpIsVisible = true
-                                        pointerSeq.incrementAndGet()
-                                        pendingRelX = 0f
-                                        pendingRelY = 0f
-                                    } else if (packetDev.isNotEmpty() &&
-                                        (lastRawX.containsKey(packetDev) || lastRawY.containsKey(packetDev))
-                                    ) {
-                                        val maxX = devMaxX[packetDev] ?: 32767f
-                                        val maxY = devMaxY[packetDev] ?: 32767f
-                                        gpAbsXNorm = ((lastRawX[packetDev] ?: 0) / maxX).coerceIn(0f, 1f)
-                                        gpAbsYNorm = ((lastRawY[packetDev] ?: 0) / maxY).coerceIn(0f, 1f)
-                                        gpHasAbs = true
-                                        gpIsStylus = packetIsStylus
-                                        gpIsVisible = true
-                                        pointerSeq.incrementAndGet()
                                     }
-                                    sawEventInPacket = false
+                                    gpHasAbs = false
+                                    gpIsStylus = false
+                                    gpIsVisible = true
+                                    pointerSeq.incrementAndGet()
+                                } else if (packetStylusAbsUpdated && packetDev.isNotEmpty()) {
+                                    val caps = deviceCaps[packetDev]
+                                    val maxX = caps?.maxX ?: 32767f
+                                    val maxY = caps?.maxY ?: 32767f
+                                    gpAbsXNorm = ((lastRawX[packetDev] ?: 0) / maxX).coerceIn(0f, 1f)
+                                    gpAbsYNorm = ((lastRawY[packetDev] ?: 0) / maxY).coerceIn(0f, 1f)
+                                    gpHasAbs = true
+                                    gpIsStylus = true
+                                    gpIsVisible = true
+                                    pointerSeq.incrementAndGet()
                                 }
+                                // Always reset per-packet state so mouse/stylus/touch never leak across packets!
+                                pendingRelX = 0f
+                                pendingRelY = 0f
+                                packetMouseMoved = false
+                                packetMouseClicked = false
+                                packetStylusAbsUpdated = false
+                                packetDev = ""
                                 continue
                             }
 
@@ -356,51 +487,72 @@ object KodaShellServer {
                             val dev = parts[0].removeSuffix(":")
                             val code = parts[2]
                             val valHex = parts[3]
-                            packetDev = dev
 
+                            var caps = deviceCaps[dev]
+                            if (caps == null) {
+                                val nowMs = SystemClock.uptimeMillis()
+                                if (nowMs - lastRescanMs >= 1000L) {
+                                    lastRescanMs = nowMs
+                                    refreshGeteventDeviceCaps(deviceCaps)
+                                    caps = deviceCaps[dev]
+                                }
+                            }
+
+                            // Ignore internal finger touchscreen completely unless stylus tool is explicitly active
+                            val isFingerTouch = caps != null && caps.isTouchscreenOnly && !caps.isStylus && dev !in liveStylusDevs
+                            if (isFingerTouch) continue
+
+                            packetDev = dev
                             when (code) {
                                 "REL_X" -> {
-                                    pendingRelX += valHex.toLongOrNull(16)?.toInt()?.toFloat() ?: 0f
-                                    packetIsMouse = true
-                                    sawEventInPacket = true
+                                    pendingRelX += parseHexSignedInt(valHex)?.toFloat() ?: 0f
+                                    packetMouseMoved = true
                                 }
                                 "REL_Y" -> {
-                                    pendingRelY += valHex.toLongOrNull(16)?.toInt()?.toFloat() ?: 0f
-                                    packetIsMouse = true
-                                    sawEventInPacket = true
-                                }
-                                "ABS_X", "ABS_MT_POSITION_X" -> {
-                                    lastRawX[dev] = valHex.toLongOrNull(16)?.toInt() ?: 0
-                                    sawEventInPacket = true
-                                }
-                                "ABS_Y", "ABS_MT_POSITION_Y" -> {
-                                    lastRawY[dev] = valHex.toLongOrNull(16)?.toInt() ?: 0
-                                    sawEventInPacket = true
-                                }
-                                "ABS_PRESSURE", "ABS_MT_PRESSURE" -> {
-                                    val pRaw = valHex.toLongOrNull(16)?.toInt() ?: 0
-                                    val maxP = devMaxP[dev] ?: 8191f
-                                    gpPressureNorm = (pRaw / maxP).coerceIn(0f, 1f)
-                                    packetIsStylus = true
-                                    sawEventInPacket = true
-                                }
-                                "BTN_TOOL_PEN", "BTN_STYLUS", "BTN_STYLUS2" -> {
-                                    packetIsStylus = true
-                                    if (valHex == "DOWN" || valHex == "00000001") {
-                                        gpIsVisible = true
-                                    }
-                                    sawEventInPacket = true
+                                    pendingRelY += parseHexSignedInt(valHex)?.toFloat() ?: 0f
+                                    packetMouseMoved = true
                                 }
                                 "BTN_LEFT", "BTN_RIGHT", "BTN_MIDDLE" -> {
-                                    packetIsMouse = true
-                                    gpIsVisible = true
-                                    pointerSeq.incrementAndGet()
+                                    packetMouseClicked = true
                                 }
-                                "BTN_TOUCH" -> {
+                                "BTN_TOOL_PEN", "BTN_TOOL_RUBBER", "BTN_STYLUS", "BTN_STYLUS2" -> {
+                                    liveStylusDevs.add(dev)
+                                    gpIsStylus = true
                                     if (valHex == "DOWN" || valHex == "00000001") {
                                         gpIsVisible = true
                                     }
-                                    sawEventInPacket = true
+                                }
+                                "ABS_X" -> {
+                                    if (caps == null || caps.isStylus || dev in liveStylusDevs || !caps.isTouchscreenOnly) {
+                                        lastRawX[dev] = parseHexSignedInt(valHex) ?: 0
+                                        packetStylusAbsUpdated = true
+                                    }
+                                }
+                                "ABS_Y" -> {
+                                    if (caps == null || caps.isStylus || dev in liveStylusDevs || !caps.isTouchscreenOnly) {
+                                        lastRawY[dev] = parseHexSignedInt(valHex) ?: 0
+                                        packetStylusAbsUpdated = true
+                                    }
+                                }
+                                "ABS_PRESSURE" -> {
+                                    if (caps == null || caps.isStylus || dev in liveStylusDevs) {
+                                        val pRaw = parseHexSignedInt(valHex) ?: 0
+                                        val maxP = caps?.maxP ?: 8191f
+                                        gpPressureNorm = (pRaw / maxP).coerceIn(0f, 1f)
+                                        packetStylusAbsUpdated = true
+                                    }
+                                }
+                                "ABS_MT_POSITION_X" -> {
+                                    if (dev in liveStylusDevs || caps?.isStylus == true) {
+                                        lastRawX[dev] = parseHexSignedInt(valHex) ?: 0
+                                        packetStylusAbsUpdated = true
+                                    }
+                                }
+                                "ABS_MT_POSITION_Y" -> {
+                                    if (dev in liveStylusDevs || caps?.isStylus == true) {
+                                        lastRawY[dev] = parseHexSignedInt(valHex) ?: 0
+                                        packetStylusAbsUpdated = true
+                                    }
                                 }
                             }
                         }
@@ -408,7 +560,7 @@ object KodaShellServer {
                     proc.waitFor()
                 } catch (_: Throwable) {
                 }
-                Thread.sleep(2500L)
+                Thread.sleep(1800L)
             }
         }, "KodaGlobalGeteventMonitor").apply {
             isDaemon = true
@@ -639,6 +791,13 @@ object KodaShellServer {
                         }
 
                         val ok = if (event != null) {
+                            if (forceHideNativePointer) {
+                                val nowMs = SystemClock.uptimeMillis()
+                                if (nowMs - lastHideEnforceMs >= 100L) {
+                                    lastHideEnforceMs = nowMs
+                                    enforceHiddenNativePointer()
+                                }
+                            }
                             if (displayId > 0) {
                                 runCatching { motionSetDisplayIdMethod?.invoke(event, displayId) }
                             }
@@ -803,6 +962,13 @@ object KodaShellServer {
                             output.flush()
                             continue
                         }
+                        if (forceHideNativePointer) {
+                            val nowMs = SystemClock.uptimeMillis()
+                            if (nowMs - lastHideEnforceMs >= 180L) {
+                                lastHideEnforceMs = nowMs
+                                enforceHiddenNativePointer()
+                            }
+                        }
                         var dx: Float
                         var dy: Float
                         synchronized(deltaLock) {
@@ -821,6 +987,41 @@ object KodaShellServer {
                         output.writeFloat(gpPressureNorm)
                         output.writeBoolean(gpIsStylus)
                         output.writeBoolean(gpIsVisible)
+                        output.flush()
+                    }
+
+                    KodaEngineProtocol.CMD_APPLY_HUB_MODE -> {
+                        val mode = input.readInt()
+                        val targetPkg = input.readUTF().ifBlank { allowedPackage }
+                        if (!authenticated) {
+                            output.writeByte(KodaEngineProtocol.STATUS_ERR_AUTH.toInt())
+                            output.flush()
+                            continue
+                        }
+                        val res = applyHubPrivilegeMode(mode, targetPkg)
+                        output.writeByte(KodaEngineProtocol.STATUS_OK.toInt())
+                        output.writeBoolean(res.applied)
+                        output.writeUTF(res.portId)
+                        output.writeUTF(res.powerRole)
+                        output.writeUTF(res.dataRole)
+                        output.writeBoolean(res.supportsDualRole)
+                        output.writeUTF(res.detail)
+                        output.flush()
+                    }
+
+                    KodaEngineProtocol.CMD_QUERY_USB_POWER -> {
+                        if (!authenticated) {
+                            output.writeByte(KodaEngineProtocol.STATUS_ERR_AUTH.toInt())
+                            output.flush()
+                            continue
+                        }
+                        val info = inspectUsbPortStatus()
+                        output.writeByte(KodaEngineProtocol.STATUS_OK.toInt())
+                        output.writeUTF(info.portId)
+                        output.writeUTF(info.powerRole)
+                        output.writeUTF(info.dataRole)
+                        output.writeBoolean(info.supportsDualRole)
+                        output.writeUTF(info.detail)
                         output.flush()
                     }
 
@@ -937,7 +1138,6 @@ object KodaShellServer {
                 for (id in InputDevice.getDeviceIds()) add(id)
             }
         }.distinct()
-        // Android 14/15/16 IInputManager / InputManagerGlobal 5-arg overload
         val mMulti = runCatching {
             im.javaClass.getMethod(
                 "setPointerIcon",
@@ -948,23 +1148,178 @@ object KodaShellServer {
                 IBinder::class.java
             )
         }.getOrNull()
+        val focusedToken = queryFocusedWindowToken()
         if (mMulti != null) {
+            val pointerIds = intArrayOf(0, -1)
             for (devId in targetDeviceIds) {
-                runCatching {
-                    mMulti.invoke(im, icon, 0, devId, 0, null)
-                    applied = true
+                for (pid in pointerIds) {
+                    runCatching {
+                        mMulti.invoke(im, icon, 0, devId, pid, focusedToken)
+                        applied = true
+                    }
+                    if (focusedToken != null) {
+                        runCatching {
+                            mMulti.invoke(im, icon, 0, devId, pid, null)
+                            applied = true
+                        }
+                    }
                 }
             }
         }
         return applied
     }
 
+    private fun queryFocusedWindowToken(): IBinder? {
+        return runCatching {
+            val wmg = Class.forName("android.view.WindowManagerGlobal")
+            val wm = wmg.getMethod("getWindowManagerService").invoke(null) ?: return@runCatching null
+            val m = wm.javaClass.methods.firstOrNull {
+                it.name == "getFocusedWindowToken" && it.parameterCount == 0
+            } ?: return@runCatching null
+            m.invoke(wm) as? IBinder
+        }.getOrNull()
+    }
+
     private fun restoreArrowPointerIcon(): Boolean {
         val im = inputManagerInstance ?: return false
-        return runCatching {
+        var restored = runCatching {
             val mType = im.javaClass.getMethod("setPointerIconType", Int::class.javaPrimitiveType)
             mType.invoke(im, PointerIcon.TYPE_ARROW)
             true
         }.getOrDefault(false)
+        if (!restored) {
+            val ctx = systemContext
+            val arrow = ctx?.let { runCatching { PointerIcon.getSystemIcon(it, PointerIcon.TYPE_ARROW) }.getOrNull() }
+            if (arrow != null) {
+                restored = applyPointerIconAcrossApis(
+                    Bitmap.createBitmap(1, 1, Bitmap.Config.ARGB_8888),
+                    0f,
+                    0f,
+                    typeOverride = PointerIcon.TYPE_ARROW,
+                    prebuiltIcon = arrow
+                )
+            }
+        }
+        return restored
+    }
+
+    data class UsbPowerRoleResult(
+        val applied: Boolean,
+        val portId: String,
+        val powerRole: String,
+        val dataRole: String,
+        val supportsDualRole: Boolean,
+        val detail: String
+    )
+
+    internal fun parseDumpsysUsbPorts(dumpsysText: String): UsbPowerRoleResult {
+        var portId = ""
+        var powerRole = "desconhecido"
+        var dataRole = "desconhecido"
+        var supportsDual = false
+
+        val portRegex = Regex("""(?:port|UsbPort)\s*\{[^}]*?id=([^,\s}]+)""", RegexOption.IGNORE_CASE)
+        val altPortRegex = Regex("""id=([a-zA-Z0-9_/-]+).*?current_mode=""", RegexOption.IGNORE_CASE)
+        portId = portRegex.find(dumpsysText)?.groupValues?.getOrNull(1)
+            ?: altPortRegex.find(dumpsysText)?.groupValues?.getOrNull(1)
+            ?: if (dumpsysText.contains("otg_default")) "otg_default"
+            else if (dumpsysText.contains("port0")) "port0"
+            else ""
+
+        Regex("""current_power_role\s*[:=]\s*([a-zA-Z_-]+)""").find(dumpsysText)?.let {
+            powerRole = it.groupValues[1].lowercase()
+        }
+        Regex("""current_data_role\s*[:=]\s*([a-zA-Z_-]+)""").find(dumpsysText)?.let {
+            dataRole = it.groupValues[1].lowercase()
+        }
+        if (powerRole == "desconhecido") {
+            if (dumpsysText.contains("sink", ignoreCase = true) && dumpsysText.contains("host", ignoreCase = true)) {
+                powerRole = "sink"
+                dataRole = "host"
+            } else if (dumpsysText.contains("source", ignoreCase = true) && dumpsysText.contains("host", ignoreCase = true)) {
+                powerRole = "source"
+                dataRole = "host"
+            }
+        }
+        val lower = dumpsysText.lowercase()
+        supportsDual = lower.contains("dual") || (lower.contains("dfp") && lower.contains("ufp")) ||
+            lower.contains("can_change_power_role=true")
+
+        val detail = if (portId.isNotBlank()) {
+            "Porta '$portId' · energia=$powerRole · dados=$dataRole · dualRole=$supportsDual"
+        } else {
+            "Controlador Type-C em modo OTG padrão (dualRole=$supportsDual)"
+        }
+        return UsbPowerRoleResult(
+            applied = portId.isNotBlank(),
+            portId = portId.ifBlank { "port0" },
+            powerRole = powerRole,
+            dataRole = dataRole,
+            supportsDualRole = supportsDual,
+            detail = detail
+        )
+    }
+
+    private fun runShellText(vararg args: String): String {
+        return runCatching {
+            val proc = ProcessBuilder(*args)
+                .redirectInput(ProcessBuilder.Redirect.from(File("/dev/null")))
+                .redirectErrorStream(true)
+                .start()
+            val out = proc.inputStream.bufferedReader().readText()
+            proc.waitFor()
+            out
+        }.getOrDefault("")
+    }
+
+    private fun inspectUsbPortStatus(): UsbPowerRoleResult {
+        val dump = runShellText("/system/bin/dumpsys", "usb")
+        return parseDumpsysUsbPorts(dump)
+    }
+
+    private fun applyHubPrivilegeMode(mode: Int, pkg: String): UsbPowerRoleResult {
+        grantPermanentAppPrivileges(pkg)
+        val before = inspectUsbPortStatus()
+        return when (mode) {
+            KodaEngineProtocol.HUB_MODE_MULTI_3PLUS -> {
+                if (pkg.isNotBlank()) {
+                    runShellText("/system/bin/am", "set-standby-bucket", pkg, "active")
+                }
+                val detail = "Privilégio Hub 3+ aplicado: processos em segundo plano desbloqueados (phantom=max), teclado em pass-through livre, Mouse + Mesa sem bloqueio (${before.detail})."
+                before.copy(applied = true, detail = detail)
+            }
+            KodaEngineProtocol.HUB_MODE_ENERGETIC_PD -> {
+                val targetPorts = listOf(before.portId, "port0", "otg_default").distinct()
+                var cmdSucceeded = false
+                for (p in targetPorts) {
+                    val r1 = runShellText("/system/bin/cmd", "usb", "set-port-roles", p, "sink", "host")
+                    val r2 = runShellText("/system/bin/dumpsys", "usb", "set-port-roles", p, "sink", "host")
+                    if (r1.isBlank() || r2.isBlank() ||
+                        r1.contains("sink", ignoreCase = true) || r2.contains("sink", ignoreCase = true)
+                    ) {
+                        cmdSucceeded = true
+                        break
+                    }
+                }
+                Thread.sleep(180L)
+                val after = inspectUsbPortStatus()
+                val sinkHostActive = after.powerRole == "sink" && after.dataRole == "host"
+                val detail = when {
+                    sinkHostActive ->
+                        "Dual-Role USB PD ativo em ${after.portId}: celular recebendo carga (sink) e controlando Hub OTG (host) simultaneamente!"
+                    after.supportsDualRole ->
+                        "Controlador ${after.portId} aceita Dual-Role (${after.powerRole}/${after.dataRole}). Conecte um Hub USB-C PD com fonte ligada para carregar + operar periféricos."
+                    else ->
+                        "Comando Shell PD enviado (role atual: ${after.powerRole}/${after.dataRole}). Se este aparelho/kernel travar VBUS em 'source', utilize Hub USB-C PD com alimentação externa ou cabo OTG-Y."
+                }
+                after.copy(applied = sinkHostActive || cmdSucceeded, detail = detail)
+            }
+            else -> {
+                before.copy(
+                    applied = true,
+                    detail = "Modo OTG padrão com pass-through ADB/APK ativo (${before.detail})."
+                )
+            }
+        }
     }
 }

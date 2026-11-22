@@ -90,7 +90,11 @@ class KodaWintabApp : Application() {
         displayManager = DisplayTargetManager(this)
         hubManager = HubManager(this, engineClient, cursorOverlayManager).apply {
             restorePersistedCursors()
+            onOperationModeChanged = { mode ->
+                usbCoordinator.hubOperationMode = mode
+            }
         }
+        usbCoordinator.hubOperationMode = hubManager.currentOperationMode()
         usbCoordinator.resolveCursorChannel = { key ->
             hubManager.resolveChannelForDeviceKey(key)
         }
@@ -189,6 +193,24 @@ class KodaWintabApp : Application() {
         onDisplayMetricsChanged?.invoke(disp)
     }
 
+    fun syncNativeCursorWithEngine() {
+        val snap = cursorOverlayManager.snapshot.value
+        val active = snap.channel1Cursor ?: snap.activeCursor
+        if (!engineClient.state.value.isActive) return
+        if (active == null || snap.isPaused) {
+            engineClient.hideNativePointer(false)
+            return
+        }
+        if (snap.mode == com.example.hub.CursorRenderMode.NATIVE) {
+            engineClient.hideNativePointer(false)
+            val ok = engineClient.sendCustomPointerIcon(active.bitmap, active.hotspotX, active.hotspotY)
+            cursorOverlayManager.setNativeHookApplied(ok)
+        } else {
+            cursorOverlayManager.resetNativeHideDispatch()
+            engineClient.hideNativePointer(true)
+        }
+    }
+
     /**
      * Streams live mouse deltas & tablet magnetic-field stylus X/Y coordinates from KodaShellServer
      * whenever the user is in the Android Launcher or any other app, and silently maintains
@@ -198,15 +220,32 @@ class KodaWintabApp : Application() {
         if (globalPointerJob?.isActive == true) return
         globalPointerJob = coopMonitorScope.launch(Dispatchers.IO) {
             var reconnectTick = 0
+            var wasActive = engineClient.state.value.isActive
+            if (wasActive) {
+                syncNativeCursorWithEngine()
+                runCatching { usbCoordinator.refreshConnectedDevices() }
+            }
             while (isActive) {
                 val st = engineClient.state.value
                 if (!st.isActive) {
-                    if (st.permanentlyActivated && reconnectTick % 120 == 0) {
-                        runCatching { engineClient.verifyConnection() }
+                    wasActive = false
+                    if (st.permanentlyActivated && reconnectTick % 80 == 0) {
+                        val checked = runCatching { engineClient.verifyConnection() }.getOrNull()
+                        if (checked?.isActive == true) {
+                            syncNativeCursorWithEngine()
+                            runCatching { usbCoordinator.refreshConnectedDevices() }
+                            runCatching { hubManager.syncModeWithEngineIfNeeded() }
+                        }
                     }
                     reconnectTick++
                     delay(25L)
                     continue
+                }
+                if (!wasActive) {
+                    wasActive = true
+                    syncNativeCursorWithEngine()
+                    runCatching { usbCoordinator.refreshConnectedDevices() }
+                    runCatching { hubManager.syncModeWithEngineIfNeeded() }
                 }
                 reconnectTick = 0
                 val snap = cursorOverlayManager.snapshot.value

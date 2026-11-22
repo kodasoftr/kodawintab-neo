@@ -33,15 +33,19 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.MergeType
 import androidx.compose.material.icons.filled.Apps
+import androidx.compose.material.icons.filled.BatteryChargingFull
+import androidx.compose.material.icons.filled.Bolt
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Draw
 import androidx.compose.material.icons.filled.Handshake
+import androidx.compose.material.icons.filled.Hub
 import androidx.compose.material.icons.filled.Keyboard
 import androidx.compose.material.icons.filled.Layers
 import androidx.compose.material.icons.filled.Mouse
 import androidx.compose.material.icons.filled.MyLocation
 import androidx.compose.material.icons.filled.RestartAlt
+import androidx.compose.material.icons.filled.Sync
 import androidx.compose.material.icons.filled.TrackChanges
 import androidx.compose.material.icons.filled.Usb
 import androidx.compose.material.icons.filled.Warning
@@ -87,6 +91,8 @@ import androidx.compose.ui.unit.dp
 import com.example.hub.CoopBannerEvent
 import com.example.hub.CursorOverlaySnapshot
 import com.example.hub.CursorRenderMode
+import com.example.hub.HubOperationMode
+import com.example.hub.HubPowerTelemetry
 import com.example.hub.HubSlotAssignment
 import com.example.hub.HubSlotId
 import com.example.hub.InstalledAppEntry
@@ -108,9 +114,12 @@ fun HubScreen(
     coopEvent: CoopBannerEvent?,
     simulatedClosedPackages: Set<String>,
     cursorSnapshot: CursorOverlaySnapshot,
+    hubPowerTelemetry: HubPowerTelemetry = HubPowerTelemetry(),
     engineActive: Boolean,
     onBack: () -> Unit,
     onRefreshDevices: () -> Unit,
+    onSelectHubMode: (HubOperationMode) -> Unit = {},
+    onRefreshPowerTelemetry: () -> Unit = {},
     onRequestUsbPermission: (String) -> Unit,
     onAssignPhysicalDevice: (HubSlotId, String?, String) -> Unit,
     onAssignCombinedDevices: (HubSlotId, String?, String, String?, String?) -> Unit,
@@ -252,6 +261,17 @@ fun HubScreen(
                                 context.startActivity(intent)
                             }
                         }
+                    )
+                }
+
+                // Multi-Peripheral 3+ & Hub Energético (PD Charging + Simultaneous OTG) Card
+                item {
+                    HubOperationModesCard(
+                        telemetry = hubPowerTelemetry,
+                        engineActive = engineActive,
+                        deviceCount = usbDevices.size,
+                        onSelectMode = onSelectHubMode,
+                        onRefreshPower = onRefreshPowerTelemetry
                     )
                 }
 
@@ -642,6 +662,156 @@ private fun GlobalCursorSettingsCard(
                             Text("Liberar via ADB", maxLines = 1)
                         }
                     }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun HubOperationModesCard(
+    telemetry: HubPowerTelemetry,
+    engineActive: Boolean,
+    deviceCount: Int,
+    onSelectMode: (HubOperationMode) -> Unit,
+    onRefreshPower: () -> Unit
+) {
+    val activeMode = telemetry.operationMode
+    val modeAccent = when (activeMode) {
+        HubOperationMode.MULTI_PERIPHERAL_3PLUS -> MaterialTheme.colorScheme.secondary
+        HubOperationMode.ENERGETIC_CHARGING -> AmberAccent
+        HubOperationMode.STANDARD -> MaterialTheme.colorScheme.primary
+    }
+    Card(
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+        modifier = Modifier
+            .fillMaxWidth()
+            .border(1.5.dp, modeAccent.copy(alpha = 0.50f), MaterialTheme.shapes.large)
+            .testTag("hub_operation_modes_card")
+    ) {
+        Column(
+            modifier = Modifier.padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp)
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Row(
+                    modifier = Modifier.weight(1f),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    Icon(
+                        imageVector = when (activeMode) {
+                            HubOperationMode.ENERGETIC_CHARGING -> Icons.Default.BatteryChargingFull
+                            HubOperationMode.MULTI_PERIPHERAL_3PLUS -> Icons.Default.Hub
+                            HubOperationMode.STANDARD -> Icons.Default.Usb
+                        },
+                        contentDescription = activeMode.title,
+                        tint = modeAccent
+                    )
+                    Column {
+                        Text("Modos Hub OTG & Energia USB-C PD", style = MaterialTheme.typography.titleMedium)
+                        Text(
+                            text = activeMode.subtitle,
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                }
+                IconButton(
+                    onClick = onRefreshPower,
+                    modifier = Modifier
+                        .size(48.dp)
+                        .testTag("hub_refresh_power_button")
+                ) {
+                    Icon(Icons.Default.Sync, contentDescription = "Atualizar energia USB PD", tint = modeAccent)
+                }
+            }
+
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    FilterChip(
+                        selected = activeMode == HubOperationMode.STANDARD,
+                        onClick = { onSelectMode(HubOperationMode.STANDARD) },
+                        label = { Text("Padrão OTG", maxLines = 1) },
+                        modifier = Modifier
+                            .weight(1f)
+                            .height(48.dp)
+                            .testTag("hub_mode_standard")
+                    )
+                    FilterChip(
+                        selected = activeMode == HubOperationMode.MULTI_PERIPHERAL_3PLUS,
+                        onClick = { onSelectMode(HubOperationMode.MULTI_PERIPHERAL_3PLUS) },
+                        leadingIcon = { Icon(Icons.Default.Hub, contentDescription = null, modifier = Modifier.size(16.dp)) },
+                        label = { Text("Hub 3+ Dispos.", maxLines = 1) },
+                        modifier = Modifier
+                            .weight(1f)
+                            .height(48.dp)
+                            .testTag("hub_mode_multi_3plus")
+                    )
+                }
+                FilterChip(
+                    selected = activeMode == HubOperationMode.ENERGETIC_CHARGING,
+                    onClick = { onSelectMode(HubOperationMode.ENERGETIC_CHARGING) },
+                    leadingIcon = { Icon(Icons.Default.Bolt, contentDescription = null, modifier = Modifier.size(16.dp)) },
+                    label = { Text("Hub Energético (Carregador + Hub OTG Simultâneo)", maxLines = 1) },
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(48.dp)
+                        .testTag("hub_mode_energetic")
+                )
+            }
+
+            // Live USB Power & Dual-Role PD Telemetry Strip
+            Surface(
+                color = MaterialTheme.colorScheme.surfaceVariant,
+                shape = MaterialTheme.shapes.small,
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Column(
+                    modifier = Modifier.padding(12.dp),
+                    verticalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    val chargeBadge = if (telemetry.isCharging) {
+                        "⚡ Carregando (${telemetry.batteryPercent}% · ${telemetry.currentMa} mA · ${telemetry.voltageMv} mV)"
+                    } else {
+                        "🔋 Bateria (${telemetry.batteryPercent}% · ${telemetry.pluggedLabel})"
+                    }
+                    Text(
+                        text = chargeBadge,
+                        style = MaterialTheme.typography.labelMedium,
+                        color = if (telemetry.isCharging) EmeraldActive else MaterialTheme.colorScheme.onSurface
+                    )
+                    Text(
+                        text = "Porta '${telemetry.usbPortId}' · Energia: ${telemetry.powerRole} · Dados: ${telemetry.dataRole} · $deviceCount periférico(s)",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.primary
+                    )
+                    Text(
+                        text = telemetry.statusDetail,
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+            }
+
+            if (engineActive) {
+                FilledTonalButton(
+                    onClick = { onSelectMode(activeMode) },
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(48.dp)
+                        .testTag("hub_apply_shell_mode_button")
+                ) {
+                    Icon(Icons.Default.Bolt, contentDescription = null, modifier = Modifier.size(18.dp))
+                    Spacer(Modifier.width(8.dp))
+                    Text("Aplicar Privilégios '${activeMode.title}' na Engine")
                 }
             }
         }

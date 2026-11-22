@@ -470,19 +470,28 @@ fun ActivationScreen(
                             ) {
                                 Column(modifier = Modifier.weight(1f)) {
                                     Text(
-                                        text = "Modo terminal aberto (anti-bloqueio OEM)",
+                                        text = if (engineState.keepTerminalOpenMode) {
+                                            "Modo terminal aberto (--child)"
+                                        } else {
+                                            "Modo Daemon Automático (--daemon)"
+                                        },
                                         style = MaterialTheme.typography.bodyMedium,
                                         color = Color.White
                                     )
                                     Text(
-                                        text = "Use caso o celular encerre o servidor em segundo plano",
+                                        text = if (engineState.keepTerminalOpenMode) {
+                                            "Mantém a janela do terminal ADB aberta exibindo confirmação ao vivo"
+                                        } else {
+                                            "Ativa em segundo plano sozinho e libera o terminal PC imediatamente"
+                                        },
                                         style = MaterialTheme.typography.labelSmall,
                                         color = Color.White.copy(alpha = 0.65f)
                                     )
                                 }
                                 Switch(
                                     checked = engineState.keepTerminalOpenMode,
-                                    onCheckedChange = onKeepTerminalOpenChanged
+                                    onCheckedChange = onKeepTerminalOpenChanged,
+                                    modifier = Modifier.testTag("activation_daemon_child_switch")
                                 )
                             }
 

@@ -96,8 +96,13 @@ class CursorOverlayManager(private val context: Context) {
     private val syncScheduled = AtomicBoolean(false)
     private var aniTickRunnable: Runnable? = null
     private var lastGlobalSeq = 0L
-    private var lastHideDispatched: Boolean? = null
+    @Volatile private var lastHideDispatched: Boolean? = null
     @Volatile private var lastOverlayPermCheckMs = 0L
+
+    fun resetNativeHideDispatch() {
+        lastHideDispatched = null
+        scheduleOverlaySync()
+    }
 
     private val syncRunnable = Runnable {
         syncScheduled.set(false)
@@ -368,8 +373,10 @@ class CursorOverlayManager(private val context: Context) {
             nextX = (rotNormX * w).coerceIn(0f, w)
             nextY = (rotNormY * h).coerceIn(0f, h)
         } else {
-            nextX = (cur.cursorX + sample.deltaX).coerceIn(0f, w)
-            nextY = (cur.cursorY + sample.deltaY).coerceIn(0f, h)
+            val scaledDx = sample.deltaX * 1.45f
+            val scaledDy = sample.deltaY * 1.45f
+            nextX = (cur.cursorX + scaledDx).coerceIn(0f, w)
+            nextY = (cur.cursorY + scaledDy).coerceIn(0f, h)
         }
         updateCursorPosition(
             x = nextX,

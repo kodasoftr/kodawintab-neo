@@ -22,8 +22,10 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.filled.BatteryChargingFull
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.ContentCopy
+import androidx.compose.material.icons.filled.Hub
 import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.Layers
 import androidx.compose.material.icons.filled.Lock
@@ -61,6 +63,8 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import com.example.hub.HubOperationMode
+import com.example.hub.HubPowerTelemetry
 import com.example.koda.engine.KodaEngineState
 import com.example.ui.theme.AmberAccent
 import com.example.ui.theme.EmeraldActive
@@ -71,8 +75,10 @@ fun PrivilegeStatusScreen(
     engineState: KodaEngineState,
     overlayGranted: Boolean,
     usbDeviceCount: Int,
+    hubPowerTelemetry: HubPowerTelemetry = HubPowerTelemetry(),
     onBack: () -> Unit,
     onSilentReconnect: () -> Unit,
+    onApplyHubMode: (HubOperationMode) -> Unit = {},
     onGrantOverlayViaAdb: () -> Unit,
     onOpenOverlaySettings: () -> Unit,
     modifier: Modifier = Modifier
@@ -248,6 +254,70 @@ fun PrivilegeStatusScreen(
                         "Conceda a permissão 'Sobrepor a outros apps' uma vez para manter o cursor customizado por cima de outros aplicativos."
                     }
                 )
+
+                // Expanded 1-time ADB Engine & Driver Privilege Profiles
+                Card(
+                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .border(1.dp, MaterialTheme.colorScheme.outline, MaterialTheme.shapes.large)
+                        .testTag("privilege_hub_modes_card")
+                ) {
+                    Column(
+                        modifier = Modifier.padding(16.dp),
+                        verticalArrangement = Arrangement.spacedBy(10.dp)
+                    ) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(10.dp)
+                        ) {
+                            Icon(Icons.Default.Hub, contentDescription = null, tint = MaterialTheme.colorScheme.secondary)
+                            Column {
+                                Text("Modos Avançados de Privilégio Engine/Driver (1x)", style = MaterialTheme.typography.titleMedium)
+                                Text(
+                                    text = "Modo atual: ${hubPowerTelemetry.operationMode.title} · Porta ${hubPowerTelemetry.usbPortId} (${hubPowerTelemetry.powerRole}/${hubPowerTelemetry.dataRole})",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = MaterialTheme.colorScheme.primary
+                                )
+                            }
+                        }
+                        Text(
+                            text = "• Anti-Kill Daemon (Phantom Processes = máx + Doze whitelist)\n" +
+                                "• Hub 3+ Periféricos: Mouse + Teclado livre + Mesa simultâneos\n" +
+                                "• Hub Energético: Tenta Dual-Role USB-C PD (sink + host) com carregador ligado\n\n" +
+                                "Status atual: ${hubPowerTelemetry.statusDetail}",
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            FilledTonalButton(
+                                onClick = { onApplyHubMode(HubOperationMode.MULTI_PERIPHERAL_3PLUS) },
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .height(48.dp)
+                                    .testTag("priv_apply_multi_3plus_button")
+                            ) {
+                                Icon(Icons.Default.Hub, contentDescription = null, modifier = Modifier.size(16.dp))
+                                Spacer(Modifier.width(6.dp))
+                                Text("Hub 3+ Perif.", maxLines = 1)
+                            }
+                            FilledTonalButton(
+                                onClick = { onApplyHubMode(HubOperationMode.ENERGETIC_CHARGING) },
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .height(48.dp)
+                                    .testTag("priv_apply_energetic_button")
+                            ) {
+                                Icon(Icons.Default.BatteryChargingFull, contentDescription = null, modifier = Modifier.size(16.dp))
+                                Spacer(Modifier.width(6.dp))
+                                Text("Hub Energético", maxLines = 1)
+                            }
+                        }
+                    }
+                }
 
                 if (!overlayGranted) {
                     Row(

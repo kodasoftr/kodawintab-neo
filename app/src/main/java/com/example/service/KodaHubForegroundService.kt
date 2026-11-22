@@ -14,6 +14,7 @@ import android.os.Build
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
+import android.os.PowerManager
 import android.text.SpannableString
 import android.text.Spanned
 import android.text.style.ForegroundColorSpan
@@ -37,6 +38,7 @@ class KodaHubForegroundService : Service() {
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private val mainHandler = Handler(Looper.getMainLooper())
     private var isPaused = false
+    private var wakeLock: PowerManager.WakeLock? = null
 
     override fun onCreate() {
         super.onCreate()
@@ -62,13 +64,43 @@ class KodaHubForegroundService : Service() {
         }
 
         val app = application as KodaWintabApp
+        acquireWakeLockIfNeeded()
         runCatching { app.usbCoordinator.registerReceiver() }
         runCatching { app.pipelineMesa1.start() }
         runCatching { app.hubManager.startCoopMonitor(app.coopMonitorScope) }
         runCatching { app.startGlobalPointerStream() }
 
         serviceScope.launch {
-            app.engineClient.verifyConnection()
+            val st = app.engineClient.verifyConnection()
+            if (st.isActive) {
+                kotlinx.coroutines.withContext(Dispatchers.IO) {
+                    runCatching { app.syncNativeCursorWithEngine() }
+                    runCatching { app.hubManager.syncModeWithEngineIfNeeded() }
+                }
+                runCatching { app.usbCoordinator.refreshConnectedDevices() }
+            }
+        }
+    }
+
+    private fun acquireWakeLockIfNeeded() {
+        runCatching {
+            if (wakeLock == null) {
+                val pm = getSystemService(Context.POWER_SERVICE) as? PowerManager ?: return
+                wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "KodaWintab::OtgHubKeepAlive").apply {
+                    setReferenceCounted(false)
+                }
+            }
+            if (wakeLock?.isHeld == false) {
+                wakeLock?.acquire(4 * 60 * 60 * 1000L)
+            }
+        }
+    }
+
+    private fun releaseWakeLock() {
+        runCatching {
+            if (wakeLock?.isHeld == true) {
+                wakeLock?.release()
+            }
         }
     }
 
@@ -116,6 +148,7 @@ class KodaHubForegroundService : Service() {
         runCatching { app?.cursorOverlayManager?.destroy() }
         // Close ONLY local TCP socket — never send CMD_SHUTDOWN so KodaShellServer stays ready forever
         runCatching { app?.engineClient?.closeConnection() }
+        releaseWakeLock()
         runCatching {
             sendBroadcast(Intent(ACTION_APP_TERMINATED).setPackage(packageName))
         }
@@ -146,6 +179,7 @@ class KodaHubForegroundService : Service() {
         runCatching { app?.usbCoordinator?.unregisterReceiver() }
         runCatching { app?.hubManager?.stopCoopMonitor() }
         runCatching { app?.cursorOverlayManager?.destroy() }
+        releaseWakeLock()
         serviceScope.cancel()
         super.onDestroy()
     }

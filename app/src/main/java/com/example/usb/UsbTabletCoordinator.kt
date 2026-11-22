@@ -21,6 +21,7 @@ import com.example.driver.TabletPipeline
 import com.example.driver.TabletProfileJson
 import com.example.driver.TabletProfileRepository
 import com.example.driver.TabletSlotId
+import com.example.hub.HubOperationMode
 import com.example.koda.engine.KodaEngineClient
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -75,6 +76,7 @@ class UsbTabletCoordinator(
     @Volatile var mouseDisplayWidthPx: Float = 1080f
     @Volatile var mouseDisplayHeightPx: Float = 2400f
     @Volatile var mouseSensitivity: Float = 1.0f
+    @Volatile var hubOperationMode: HubOperationMode = HubOperationMode.STANDARD
 
     private var mouseCursorX = 540f
     private var mouseCursorY = 960f
@@ -174,7 +176,7 @@ class UsbTabletCoordinator(
             context,
             usbReceiver,
             filter,
-            ContextCompat.RECEIVER_NOT_EXPORTED
+            ContextCompat.RECEIVER_EXPORTED
         )
         runCatching { inputManager?.registerInputDeviceListener(inputDeviceListener, null) }
         receiverRegistered = true
@@ -343,7 +345,8 @@ class UsbTabletCoordinator(
         } else {
             PendingIntent.FLAG_UPDATE_CURRENT
         }
-        val pi = PendingIntent.getBroadcast(context, device.deviceId, Intent(ACTION_USB_PERMISSION), flags)
+        val permIntent = Intent(ACTION_USB_PERMISSION).setPackage(context.packageName)
+        val pi = PendingIntent.getBroadcast(context, device.deviceId, permIntent, flags)
         mgr.requestPermission(device, pi)
     }
 
@@ -418,7 +421,8 @@ class UsbTabletCoordinator(
             Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_DISPLAY)
             val buffer = ByteArray(packetSize)
             while (running.get()) {
-                val bytesRead = connection.bulkTransfer(endpoint, buffer, packetSize, 40)
+                val transferTimeoutMs = if (hubOperationMode == HubOperationMode.MULTI_PERIPHERAL_3PLUS) 12 else 32
+                val bytesRead = connection.bulkTransfer(endpoint, buffer, packetSize, transferTimeoutMs)
                 if (bytesRead > 0 && mouseParser.parse(buffer, bytesRead, mouseSensitivity)) {
                     val channel = resolveCursorChannel?.invoke(key) ?: 1
                     val curX: Float
@@ -498,7 +502,8 @@ class UsbTabletCoordinator(
             Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_DISPLAY)
             val preAllocBuffer = ByteArray(packetSize)
             while (running.get()) {
-                val bytesRead = connection.bulkTransfer(endpoint, preAllocBuffer, packetSize, 50)
+                val transferTimeoutMs = if (hubOperationMode == HubOperationMode.MULTI_PERIPHERAL_3PLUS) 16 else 40
+                val bytesRead = connection.bulkTransfer(endpoint, preAllocBuffer, packetSize, transferTimeoutMs)
                 if (bytesRead > 0) {
                     pipeline.ringBuffer.offer(preAllocBuffer, bytesRead, System.nanoTime())
                     pipeline.wakeWorker()

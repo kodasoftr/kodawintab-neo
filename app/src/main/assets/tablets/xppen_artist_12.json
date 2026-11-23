@@ -1,0 +1,32 @@
+{
+  "id": "xppen_artist_12",
+  "name": "XP-Pen Artist 12 / 13.3 Pro",
+  "brand": "XP-Pen",
+  "vendorId": 10429,
+  "productIds": [2314, 2344, 2332, 2378],
+  "widthMm": 263.2,
+  "heightMm": 148.1,
+  "maxX": 32767,
+  "maxY": 32767,
+  "maxPressure": 8191,
+  "lpi": 5080,
+  "pollingRateHz": 220,
+  "interfaceNumber": 2,
+  "endpointAddress": 131,
+  "parserType": "XP_PEN",
+  "initControlTransfers": [
+    {
+      "requestType": 33,
+      "request": 9,
+      "value": 514,
+      "index": 2,
+      "dataHex": "02B0040000000000"
+    }
+  ],
+  "expressKeysCount": 8,
+  "supportsTilt": true,
+  "isPenDisplay": true,
+  "nativeWidthPx": 1920,
+  "nativeHeightPx": 1080,
+  "nativeDpi": 185
+}

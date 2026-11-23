@@ -46,6 +46,7 @@ import com.example.ui.KodaViewModel
 import com.example.ui.screens.ActivationScreen
 import com.example.ui.screens.HomeScreen
 import com.example.ui.screens.HubScreen
+import com.example.ui.screens.PenDisplayScreen
 import com.example.ui.screens.PrivilegeStatusScreen
 import com.example.ui.screens.TabletDriverScreen
 import com.example.ui.theme.KodaWintabTheme
@@ -57,6 +58,7 @@ object KodaRoutes {
     const val ROUTE_HOME = "home"
     const val ROUTE_MESA = "mesa"
     const val ROUTE_HUB = "hub"
+    const val ROUTE_PEN_DISPLAY = "pen_display"
 }
 
 class MainActivity : ComponentActivity() {
@@ -172,7 +174,10 @@ fun KodaWintabRoot(
     val hexFrames by viewModel.hexFrames.collectAsStateWithLifecycle()
     val statusToast by viewModel.statusToast.collectAsStateWithLifecycle()
     val cursorSnapshot by viewModel.cursorSnapshot.collectAsStateWithLifecycle()
-    val hubPowerTelemetry by viewModel.hubPowerTelemetry.collectAsStateWithLifecycle()
+    val penDisplayState by viewModel.penDisplayState.collectAsStateWithLifecycle()
+    val streamTelemetry by viewModel.streamTelemetry.collectAsStateWithLifecycle()
+    val boundPenDisplayPackages by viewModel.boundPenDisplayPackages.collectAsStateWithLifecycle()
+    val activePenDisplayTasks by viewModel.activePenDisplayTasks.collectAsStateWithLifecycle()
 
     val notifPermissionLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.RequestPermission()
@@ -186,7 +191,6 @@ fun KodaWintabRoot(
         val obs = LifecycleEventObserver { _, event ->
             if (event == Lifecycle.Event.ON_RESUME) {
                 viewModel.refreshOverlayPermission()
-                viewModel.refreshPowerTelemetry()
             }
         }
         lifecycleOwner.lifecycle.addObserver(obs)
@@ -270,11 +274,10 @@ fun KodaWintabRoot(
                 ActivationScreen(
                     engineState = engineState,
                     errorPopup = errorPopup,
+                    onActivateSingleEngine = { viewModel.activateSingleEngine() },
                     onSilentPoll = { viewModel.silentPollEngineConnection() },
                     onVerifyConnection = { viewModel.verifyEngineConnection(showErrorPopupOnFail = true) },
                     onSelectTransportMode = { viewModel.setAdbTransportMode(it) },
-                    onWifiPortChanged = { viewModel.setWifiPort(it) },
-                    onKeepTerminalOpenChanged = { viewModel.setKeepTerminalOpenMode(it) },
                     onRefreshNetworkIp = { viewModel.refreshLocalNetworkIp() },
                     onDismissErrorPopup = { viewModel.dismissErrorPopup() },
                     onActivatedOpenApp = {
@@ -282,10 +285,6 @@ fun KodaWintabRoot(
                         navController.navigate(KodaRoutes.ROUTE_HOME) {
                             popUpTo(KodaRoutes.ROUTE_ACTIVATION) { inclusive = true }
                         }
-                    },
-                    onEnterDiagnostic = {
-                        viewModel.enterDiagnosticMode()
-                        navController.navigate(KodaRoutes.ROUTE_HOME)
                     }
                 )
             }
@@ -297,14 +296,39 @@ fun KodaWintabRoot(
                     usbDevices = usbDevices,
                     displays = displays,
                     hubSlots = hubSlots,
+                    penDisplayState = penDisplayState,
+                    streamTelemetry = streamTelemetry,
                     onOpenMesa = { navController.navigate(KodaRoutes.ROUTE_MESA) },
                     onOpenHub = { navController.navigate(KodaRoutes.ROUTE_HUB) },
+                    onOpenPenDisplay = { navController.navigate(KodaRoutes.ROUTE_PEN_DISPLAY) },
                     onOpenActivation = {
-                        if (engineState.permanentlyActivated || engineState.isActive || viewModel.isPermanentlyActivated()) {
+                        if (engineState.coreEngineActive || engineState.permanentlyActivated || engineState.isActive || viewModel.isPermanentlyActivated()) {
                             navController.navigate(KodaRoutes.ROUTE_PRIVILEGES)
                         } else {
                             navController.navigate(KodaRoutes.ROUTE_ACTIVATION)
                         }
+                    }
+                )
+            }
+
+            composable(KodaRoutes.ROUTE_PEN_DISPLAY) {
+                PenDisplayScreen(
+                    penDisplayState = penDisplayState,
+                    streamTelemetry = streamTelemetry,
+                    installedApps = installedApps,
+                    boundPackages = boundPenDisplayPackages,
+                    activeTasks = activePenDisplayTasks,
+                    engineIsActive = engineState.isActive,
+                    onBack = { navController.popBackStack() },
+                    onToggleConnected = { viewModel.togglePenDisplayConnected(it) },
+                    onSelectPreset = { viewModel.selectPenDisplayPreset(it) },
+                    onStartVirtualDesktop = { viewModel.startPenDisplayVirtualDesktop() },
+                    onStopVirtualDesktop = { viewModel.stopPenDisplayVirtualDesktop() },
+                    onToggleBoundApp = { viewModel.toggleBoundPenDisplayApp(it) },
+                    onLaunchAppOnPenDisplay = { viewModel.launchAppOnPenDisplay(it) },
+                    onRemoveTask = { viewModel.removePenDisplayTask(it) },
+                    onSendTestStylus = { nx, ny, p, down ->
+                        viewModel.sendPenDisplayTestStylus(nx, ny, p, down)
                     }
                 )
             }
@@ -314,14 +338,11 @@ fun KodaWintabRoot(
                     engineState = engineState,
                     overlayGranted = cursorSnapshot.overlayPermissionGranted,
                     usbDeviceCount = usbDevices.size,
-                    hubPowerTelemetry = hubPowerTelemetry,
                     onBack = { navController.popBackStack() },
                     onSilentReconnect = {
                         viewModel.silentPollEngineConnection()
                         viewModel.refreshOverlayPermission()
-                        viewModel.refreshPowerTelemetry()
                     },
-                    onApplyHubMode = { viewModel.selectHubOperationMode(it) },
                     onGrantOverlayViaAdb = { viewModel.grantOverlayViaAdb() },
                     onOpenOverlaySettings = {
                         runCatching {
@@ -378,12 +399,9 @@ fun KodaWintabRoot(
                     coopEvent = coopEvent,
                     simulatedClosedPackages = simulatedClosedPackages,
                     cursorSnapshot = cursorSnapshot,
-                    hubPowerTelemetry = hubPowerTelemetry,
                     engineActive = engineState.isActive,
                     onBack = { navController.popBackStack() },
                     onRefreshDevices = { viewModel.refreshUsbAndDisplays() },
-                    onSelectHubMode = { viewModel.selectHubOperationMode(it) },
-                    onRefreshPowerTelemetry = { viewModel.refreshPowerTelemetry() },
                     onRequestUsbPermission = { viewModel.requestUsbPermission(it) },
                     onAssignPhysicalDevice = { slot, key, name -> viewModel.assignHubDevice(slot, key, name) },
                     onAssignCombinedDevices = { slot, k1, n1, k2, n2 ->

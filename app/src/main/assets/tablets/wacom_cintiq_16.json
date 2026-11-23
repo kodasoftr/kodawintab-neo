@@ -1,0 +1,32 @@
+{
+  "id": "wacom_cintiq_16",
+  "name": "Wacom Cintiq 16 / Wacom One",
+  "brand": "Wacom",
+  "vendorId": 1386,
+  "productIds": [912, 934, 913],
+  "widthMm": 344.16,
+  "heightMm": 193.59,
+  "maxX": 68832,
+  "maxY": 38718,
+  "maxPressure": 8191,
+  "lpi": 5080,
+  "pollingRateHz": 200,
+  "interfaceNumber": 0,
+  "endpointAddress": 129,
+  "parserType": "WACOM",
+  "initControlTransfers": [
+    {
+      "requestType": 33,
+      "request": 9,
+      "value": 770,
+      "index": 0,
+      "dataHex": "0202"
+    }
+  ],
+  "expressKeysCount": 0,
+  "supportsTilt": true,
+  "isPenDisplay": true,
+  "nativeWidthPx": 1920,
+  "nativeHeightPx": 1080,
+  "nativeDpi": 142
+}

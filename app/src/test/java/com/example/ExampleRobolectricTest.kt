@@ -267,24 +267,39 @@ class ExampleRobolectricTest {
     }
 
     @Test
-    fun `cuj activation error popup fullscreen blank sheet calibration and hub combined flow`() {
+    fun `cuj activation single tap pen display fullscreen blank sheet calibration and hub combined flow`() {
         composeTestRule.waitForIdle()
         composeTestRule.onNodeWithTag("developer_signature_text").performScrollTo().assertIsDisplayed()
-        composeTestRule.onNodeWithTag("verify_connection_button").performScrollTo().performClick()
-        composeTestRule.waitForIdle()
+        composeTestRule.onNodeWithTag("single_activate_engine_button").performScrollTo().performClick()
 
-        // Error popup appears with clear error explanation when ADB is inactive
-        composeTestRule.waitUntil(timeoutMillis = 5_000L) {
-            composeTestRule.onAllNodes(hasTestTag("error_popup_ok_button"))
-                .fetchSemanticsNodes().isNotEmpty()
+        // Single Activation animates 4 core subsystems and transitions to Home (or offers activated_open_app_button)
+        composeTestRule.waitUntil(timeoutMillis = 6_000L) {
+            composeTestRule.onAllNodes(hasTestTag("home_pen_display_button"))
+                .fetchSemanticsNodes().isNotEmpty() ||
+                composeTestRule.onAllNodes(hasTestTag("activated_open_app_button"))
+                    .fetchSemanticsNodes().isNotEmpty()
         }
-        composeTestRule.onNodeWithTag("error_popup_ok_button").assertIsDisplayed().performClick()
+        if (composeTestRule.onAllNodes(hasTestTag("home_pen_display_button")).fetchSemanticsNodes().isEmpty()) {
+            composeTestRule.onNodeWithTag("activated_open_app_button").performClick()
+            composeTestRule.waitUntil(timeoutMillis = 5_000L) {
+                composeTestRule.onAllNodes(hasTestTag("home_pen_display_button"))
+                    .fetchSemanticsNodes().isNotEmpty()
+            }
+        }
         composeTestRule.waitForIdle()
 
-        // Diagnostic flow into Home -> Mesa
-        composeTestRule.onNodeWithTag("enter_diagnostic_button").performScrollTo().performClick()
+        // Open Pen Display & Kodasoftr Desktop Studio -> verify controls -> back
+        composeTestRule.onNodeWithTag("home_pen_display_button").performScrollTo().performClick()
+        composeTestRule.waitForIdle()
+        composeTestRule.onNodeWithTag("pendisplay_connected_switch").assertIsDisplayed()
+        composeTestRule.onNodeWithTag("pendisplay_kodasoftr_preview").performScrollTo().assertIsDisplayed()
+        composeTestRule.onNodeWithTag("pendisplay_test_stylus_button").performScrollTo().performClick()
+        composeTestRule.onNodeWithTag("pendisplay_stream_card").performScrollTo().assertIsDisplayed()
+        composeTestRule.onNodeWithTag("pendisplay_app_router_section").performScrollTo().assertIsDisplayed()
+        composeTestRule.onNodeWithTag("pendisplay_back_button").performClick()
         composeTestRule.waitForIdle()
 
+        // Home -> Mesa
         composeTestRule.onNodeWithTag("home_mesa_button").performScrollTo().performClick()
         composeTestRule.waitForIdle()
         composeTestRule.onNodeWithTag("otd_tab_tablet").assertIsDisplayed()
@@ -388,5 +403,54 @@ class ExampleRobolectricTest {
         // Even if Shell socket is stopped when Developer Options is turned OFF, permanent OTG activation stays intact
         assertTrue(result.permanentlyActivated)
         assertTrue(result.lastCheckMessage.contains("USB OTG Direto", ignoreCase = true))
+    }
+
+    @Test
+    fun `pen display profile repository resolves Artist 12 Kamvas 13 and Cintiq 16`() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val repo = TabletProfileRepository(context)
+        val penDisplays = repo.getPenDisplayProfiles()
+        assertTrue(penDisplays.size >= 4)
+
+        val artist12 = repo.findByVidPid(10429, 2314, "XP-Pen Artist 12")
+        assertNotNull(artist12)
+        assertTrue(artist12?.isPenDisplay == true)
+        assertEquals(1920, artist12?.nativeWidthPx)
+        assertEquals(1080, artist12?.nativeHeightPx)
+
+        val kamvas13 = repo.findByVidPid(9580, 112, "Huion Kamvas 13")
+        assertNotNull(kamvas13)
+        assertTrue(kamvas13?.isPenDisplay == true)
+
+        val cintiq16 = repo.findByVidPid(1386, 912, "Wacom Cintiq 16")
+        assertNotNull(cintiq16)
+        assertTrue(cintiq16?.isPenDisplay == true)
+    }
+
+    @Test
+    fun `single engine activation works offline without PC and persists`() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        context.getSharedPreferences("koda_engine_prefs", Context.MODE_PRIVATE).edit().clear().commit()
+        val client = KodaEngineClient(context)
+
+        val activated = client.activateSingleEngine()
+        assertTrue(activated.coreEngineActive)
+        assertTrue(activated.permanentlyActivated)
+        assertTrue(KodaEngineClient(context).isPermanentlyActivated())
+        assertTrue(KodaEngineClient(context).state.value.coreEngineActive)
+    }
+
+    @Test
+    fun `koda app router persists bound packages and pen display manager recognizes VID PID`() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val app = context.applicationContext as KodaWintabApp
+        val pkg = "org.krita"
+        app.penDisplayManager.appRouter.setPackageBound(pkg, true, 12)
+        assertTrue(pkg in app.penDisplayManager.appRouter.boundPackages.value)
+
+        val recognized = app.penDisplayManager.recognizeUsbVidPidForDisplay(9580, 112, "Huion Kamvas 13")
+        assertTrue(recognized)
+        assertTrue(app.penDisplayManager.state.value.isPenDisplayConnected)
+        app.penDisplayManager.stopPenDisplaySession()
     }
 }

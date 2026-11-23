@@ -1,0 +1,32 @@
+{
+  "id": "ugee_ue12_display",
+  "name": "Ugee UE12 / U1200 Pen Display",
+  "brand": "Ugee",
+  "vendorId": 10429,
+  "productIds": [2353, 2354],
+  "widthMm": 263.2,
+  "heightMm": 148.1,
+  "maxX": 32767,
+  "maxY": 32767,
+  "maxPressure": 8191,
+  "lpi": 5080,
+  "pollingRateHz": 220,
+  "interfaceNumber": 2,
+  "endpointAddress": 131,
+  "parserType": "UGEE_S640",
+  "initControlTransfers": [
+    {
+      "requestType": 33,
+      "request": 9,
+      "value": 514,
+      "index": 2,
+      "dataHex": "02B0040000000000"
+    }
+  ],
+  "expressKeysCount": 8,
+  "supportsTilt": true,
+  "isPenDisplay": true,
+  "nativeWidthPx": 1920,
+  "nativeHeightPx": 1080,
+  "nativeDpi": 185
+}

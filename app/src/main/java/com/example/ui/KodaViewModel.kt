@@ -21,12 +21,14 @@ import com.example.hub.CoopBannerEvent
 import com.example.hub.CursorDecoder
 import com.example.hub.CursorOverlaySnapshot
 import com.example.hub.CursorRenderMode
-import com.example.hub.HubOperationMode
-import com.example.hub.HubPowerTelemetry
 import com.example.hub.HubSlotAssignment
 import com.example.hub.HubSlotId
 import com.example.hub.InstalledAppEntry
 import com.example.koda.engine.KodaEngineState
+import com.example.pendisplay.KodaStreamTelemetry
+import com.example.pendisplay.PenDisplayPreset
+import com.example.pendisplay.PenDisplayState
+import com.example.pendisplay.PenDisplayTaskEntry
 import com.example.service.KodaHubForegroundService
 import com.example.usb.ConnectedUsbDeviceInfo
 import kotlinx.coroutines.Dispatchers
@@ -47,6 +49,7 @@ class KodaViewModel(application: Application) : AndroidViewModel(application) {
     private val displayManager = app.displayManager
     private val hubManager = app.hubManager
     private val cursorOverlayManager = app.cursorOverlayManager
+    private val penDisplayManager = app.penDisplayManager
 
     val engineState: StateFlow<KodaEngineState> = engineClient.state
     val usbDevices: StateFlow<List<ConnectedUsbDeviceInfo>> = usbCoordinator.devices
@@ -58,7 +61,10 @@ class KodaViewModel(application: Application) : AndroidViewModel(application) {
     val coopEvent: StateFlow<CoopBannerEvent?> = hubManager.coopEvent
     val simulatedClosedPackages: StateFlow<Set<String>> = hubManager.simulatedClosedPackages
     val cursorSnapshot: StateFlow<CursorOverlaySnapshot> = cursorOverlayManager.snapshot
-    val hubPowerTelemetry: StateFlow<HubPowerTelemetry> = hubManager.powerTelemetry
+    val penDisplayState: StateFlow<PenDisplayState> = penDisplayManager.state
+    val streamTelemetry: StateFlow<KodaStreamTelemetry> = penDisplayManager.streamEngine.telemetry
+    val boundPenDisplayPackages: StateFlow<Set<String>> = penDisplayManager.appRouter.boundPackages
+    val activePenDisplayTasks: StateFlow<List<PenDisplayTaskEntry>> = penDisplayManager.appRouter.activeTasks
 
     private val _selectedSlot = MutableStateFlow(TabletSlotId.GLOBAL)
     val selectedSlot: StateFlow<TabletSlotId> = _selectedSlot.asStateFlow()
@@ -112,13 +118,6 @@ class KodaViewModel(application: Application) : AndroidViewModel(application) {
             if (connState.isActive) {
                 cursorOverlayManager.setPaused(false)
                 startHubServiceSafely()
-                withContext(Dispatchers.IO) {
-                    runCatching { app.syncNativeCursorWithEngine() }
-                    runCatching { hubManager.syncModeWithEngineIfNeeded() }
-                }
-                runCatching { usbCoordinator.refreshConnectedDevices() }
-            } else {
-                hubManager.refreshPowerTelemetry()
             }
             cursorOverlayManager.refreshOverlayPermission()
         }
@@ -145,12 +144,6 @@ class KodaViewModel(application: Application) : AndroidViewModel(application) {
             val res = engineClient.verifyConnection()
             if (res.isActive) {
                 startHubServiceSafely()
-                cursorOverlayManager.refreshOverlayPermission()
-                withContext(Dispatchers.IO) {
-                    runCatching { app.syncNativeCursorWithEngine() }
-                    runCatching { hubManager.syncModeWithEngineIfNeeded() }
-                }
-                usbCoordinator.refreshConnectedDevices()
                 _errorPopup.value = null
             } else if (showErrorPopupOnFail) {
                 _errorPopup.value = AppErrorReport(
@@ -168,12 +161,6 @@ class KodaViewModel(application: Application) : AndroidViewModel(application) {
             val res = engineClient.verifyConnection()
             if (res.isActive) {
                 startHubServiceSafely()
-                cursorOverlayManager.refreshOverlayPermission()
-                withContext(Dispatchers.IO) {
-                    runCatching { app.syncNativeCursorWithEngine() }
-                    runCatching { hubManager.syncModeWithEngineIfNeeded() }
-                }
-                usbCoordinator.refreshConnectedDevices()
             }
         }
     }
@@ -213,6 +200,67 @@ class KodaViewModel(application: Application) : AndroidViewModel(application) {
     fun enterDiagnosticMode() {
         engineClient.enterDiagnosticMode()
         startHubServiceSafely()
+    }
+
+    fun activateSingleEngine() {
+        engineClient.activateSingleEngine()
+        cursorOverlayManager.setPaused(false)
+        cursorOverlayManager.refreshOverlayPermission()
+        startHubServiceSafely()
+        runCatching { usbCoordinator.registerReceiver() }
+        runCatching { usbCoordinator.refreshConnectedDevices() }
+        displayManager.refreshDisplays()
+        _statusToast.value = "Koda Core Engine ativada em 1 toque (sem PC / sem Modo Desenvolvedor)!"
+    }
+
+    fun togglePenDisplayConnected(enabled: Boolean) {
+        penDisplayManager.setPenDisplayConnectedManual(enabled)
+        _statusToast.value = if (enabled) {
+            "Mesa com Tela ativada · Display Virtual Kodasoftr iniciado"
+        } else {
+            "Mesa com Tela encerrada"
+        }
+    }
+
+    fun selectPenDisplayPreset(preset: PenDisplayPreset) {
+        penDisplayManager.selectPreset(preset)
+        _statusToast.value = "Resolução da Pen Display: ${preset.widthPx}×${preset.heightPx} · ${preset.dpi} DPI"
+    }
+
+    fun startPenDisplayVirtualDesktop() {
+        val ok = penDisplayManager.startPenDisplaySession()
+        _statusToast.value = if (ok) {
+            "Área de trabalho Kodasoftr projetada no Display Virtual!"
+        } else {
+            "Não foi possível iniciar o Display Virtual"
+        }
+    }
+
+    fun stopPenDisplayVirtualDesktop() {
+        penDisplayManager.stopPenDisplaySession()
+        _statusToast.value = "Display Virtual Kodasoftr parado"
+    }
+
+    fun toggleBoundPenDisplayApp(packageName: String) {
+        penDisplayManager.toggleBoundApp(packageName)
+    }
+
+    fun launchAppOnPenDisplay(app: InstalledAppEntry) {
+        val ok = penDisplayManager.launchAppOnPenDisplay(app)
+        _statusToast.value = if (ok) {
+            "${app.label} redirecionado para a Pen Display (#${penDisplayManager.state.value.virtualDisplayId})"
+        } else {
+            "Não foi possível abrir ${app.label} na Pen Display"
+        }
+    }
+
+    fun removePenDisplayTask(packageName: String) {
+        penDisplayManager.appRouter.removeTaskEntry(packageName)
+    }
+
+    fun sendPenDisplayTestStylus(normX: Float, normY: Float, pressure: Float, isTipDown: Boolean) {
+        penDisplayManager.dispatchStylusInputToPenDisplay(normX, normY, pressure, isTipDown)
+        feedSimulatedUgeePacket(normX, normY, pressure, isTipDown)
     }
 
     fun selectTabletSlot(slotId: TabletSlotId) {
@@ -433,24 +481,6 @@ class KodaViewModel(application: Application) : AndroidViewModel(application) {
         cursorOverlayManager.refreshOverlayPermission()
         viewModelScope.launch(Dispatchers.IO) {
             runCatching { hubManager.loadLaunchableApps() }
-            runCatching { hubManager.syncModeWithEngineIfNeeded() }
-        }
-    }
-
-    fun selectHubOperationMode(mode: HubOperationMode) {
-        viewModelScope.launch {
-            val telemetry = withContext(Dispatchers.IO) {
-                hubManager.selectHubOperationMode(mode)
-            }
-            usbCoordinator.hubOperationMode = mode
-            usbCoordinator.refreshConnectedDevices()
-            _statusToast.value = "${mode.title}: ${telemetry.statusDetail}"
-        }
-    }
-
-    fun refreshPowerTelemetry() {
-        viewModelScope.launch(Dispatchers.IO) {
-            hubManager.syncModeWithEngineIfNeeded()
         }
     }
 

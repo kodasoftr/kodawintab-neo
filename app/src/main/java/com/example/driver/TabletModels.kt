@@ -83,7 +83,11 @@ data class TabletProfileJson(
     val parserType: String,
     val initControlTransfers: List<UsbControlTransferCmd> = emptyList(),
     val expressKeysCount: Int = 0,
-    val supportsTilt: Boolean = false
+    val supportsTilt: Boolean = false,
+    val isPenDisplay: Boolean = false,
+    val nativeWidthPx: Int = 0,
+    val nativeHeightPx: Int = 0,
+    val nativeDpi: Int = 0
 )
 
 data class PressureControlPoint(

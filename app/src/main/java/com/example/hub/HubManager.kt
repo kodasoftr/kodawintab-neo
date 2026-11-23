@@ -4,12 +4,8 @@ import android.app.usage.UsageEvents
 import android.app.usage.UsageStatsManager
 import android.content.Context
 import android.content.Intent
-import android.content.IntentFilter
 import android.content.pm.PackageManager
-import android.os.BatteryManager
 import com.example.koda.engine.KodaEngineClient
-import com.example.koda.engine.KodaEngineProtocol
-import com.example.koda.engine.UsbPortPowerResult
 import com.example.usb.UsbPeripheralKind
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -20,7 +16,6 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
-import kotlin.math.abs
 
 enum class HubSlotId(
     val label: String,
@@ -80,42 +75,6 @@ data class CoopBannerEvent(
     val timestampMs: Long
 )
 
-enum class HubOperationMode(
-    val protocolCode: Int,
-    val title: String,
-    val subtitle: String
-) {
-    STANDARD(
-        protocolCode = KodaEngineProtocol.HUB_MODE_STANDARD,
-        title = "Hub Padrão Seletivo",
-        subtitle = "Reivindicação seletiva de Mesa e Mouse · ADB/APK livre no sistema"
-    ),
-    MULTI_PERIPHERAL_3PLUS(
-        protocolCode = KodaEngineProtocol.HUB_MODE_MULTI_3PLUS,
-        title = "Hub 3+ Periféricos",
-        subtitle = "Mouse + Teclado (pass-through) + Mesa simultâneos sem travar OTG"
-    ),
-    ENERGETIC_CHARGING(
-        protocolCode = KodaEngineProtocol.HUB_MODE_ENERGETIC_PD,
-        title = "Hub Energético (Carga + OTG)",
-        subtitle = "Negocia USB-C PD (sink+host) para carregar celular e alimentar Hub"
-    )
-}
-
-data class HubPowerTelemetry(
-    val operationMode: HubOperationMode = HubOperationMode.STANDARD,
-    val isCharging: Boolean = false,
-    val batteryPercent: Int = 0,
-    val pluggedLabel: String = "Bateria interna",
-    val currentMa: Int = 0,
-    val voltageMv: Int = 0,
-    val usbPortId: String = "port0",
-    val powerRole: String = "desconhecido",
-    val dataRole: String = "desconhecido",
-    val supportsDualRole: Boolean = false,
-    val statusDetail: String = "Pronto para operar em Modo Padrão OTG"
-)
-
 /**
  * Manages the 6-slot Multi-Device Hub (2 Mice + 2 Keyboards + 2 Tablets) with distinct virtual
  * deviceIds, combined Mouse+Tablet simultaneous slot attribution, per-window routing, global
@@ -140,109 +99,7 @@ class HubManager(
     private val _simulatedClosedPackages = MutableStateFlow<Set<String>>(emptySet())
     val simulatedClosedPackages: StateFlow<Set<String>> = _simulatedClosedPackages.asStateFlow()
 
-    private val prefs = context.getSharedPreferences(PREFS_HUB, Context.MODE_PRIVATE)
-
-    private val _powerTelemetry = MutableStateFlow(
-        HubPowerTelemetry(
-            operationMode = runCatching {
-                HubOperationMode.valueOf(
-                    prefs.getString(KEY_HUB_MODE, HubOperationMode.STANDARD.name)
-                        ?: HubOperationMode.STANDARD.name
-                )
-            }.getOrDefault(HubOperationMode.STANDARD)
-        )
-    )
-    val powerTelemetry: StateFlow<HubPowerTelemetry> = _powerTelemetry.asStateFlow()
-
-    @Volatile var onOperationModeChanged: ((HubOperationMode) -> Unit)? = null
-
     private var monitorJob: Job? = null
-
-    fun currentOperationMode(): HubOperationMode = _powerTelemetry.value.operationMode
-
-    fun refreshPowerTelemetry(shellResult: UsbPortPowerResult? = null) {
-        val battIntent = runCatching {
-            context.registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
-        }.getOrNull()
-        val level = battIntent?.getIntExtra(BatteryManager.EXTRA_LEVEL, -1) ?: -1
-        val scale = battIntent?.getIntExtra(BatteryManager.EXTRA_SCALE, 100)?.coerceAtLeast(1) ?: 100
-        val pct = if (level >= 0) ((level * 100f) / scale).toInt().coerceIn(0, 100) else _powerTelemetry.value.batteryPercent
-        val status = battIntent?.getIntExtra(BatteryManager.EXTRA_STATUS, -1) ?: -1
-        val plugged = battIntent?.getIntExtra(BatteryManager.EXTRA_PLUGGED, 0) ?: 0
-        val voltageMv = battIntent?.getIntExtra(BatteryManager.EXTRA_VOLTAGE, 0) ?: 0
-        val bm = context.getSystemService(Context.BATTERY_SERVICE) as? BatteryManager
-        val rawUa = runCatching { bm?.getIntProperty(BatteryManager.BATTERY_PROPERTY_CURRENT_NOW) ?: 0 }.getOrDefault(0)
-        val currentMa = if (abs(rawUa) > 10_000) rawUa / 1000 else rawUa
-
-        val isCharging = status == BatteryManager.BATTERY_STATUS_CHARGING ||
-            status == BatteryManager.BATTERY_STATUS_FULL ||
-            plugged != 0
-        val pluggedLabel = when (plugged) {
-            BatteryManager.BATTERY_PLUGGED_AC -> "Carregador AC / USB-C PD"
-            BatteryManager.BATTERY_PLUGGED_USB -> "Porta USB / Hub Energético"
-            BatteryManager.BATTERY_PLUGGED_WIRELESS -> "Carregador Sem Fio"
-            else -> if (isCharging) "Fonte Externa Conectada" else "Sem carregador externo (Bateria)"
-        }
-
-        val cur = _powerTelemetry.value
-        _powerTelemetry.value = cur.copy(
-            isCharging = isCharging,
-            batteryPercent = pct,
-            pluggedLabel = pluggedLabel,
-            currentMa = currentMa,
-            voltageMv = voltageMv,
-            usbPortId = shellResult?.portId ?: cur.usbPortId,
-            powerRole = shellResult?.powerRole ?: cur.powerRole,
-            dataRole = shellResult?.dataRole ?: cur.dataRole,
-            supportsDualRole = shellResult?.supportsDualRole ?: cur.supportsDualRole,
-            statusDetail = shellResult?.detail ?: cur.statusDetail
-        )
-    }
-
-    fun selectHubOperationMode(mode: HubOperationMode): HubPowerTelemetry {
-        prefs.edit().putString(KEY_HUB_MODE, mode.name).apply()
-        val prev = _powerTelemetry.value
-        val localHint = when (mode) {
-            HubOperationMode.STANDARD ->
-                "Modo Padrão OTG ativo · Mesa e Mouse seletivos."
-            HubOperationMode.MULTI_PERIPHERAL_3PLUS ->
-                "Hub 3+ Periféricos ativo · Escalonamento USB não-bloqueante para Mouse + Teclado + Mesa."
-            HubOperationMode.ENERGETIC_CHARGING ->
-                "Hub Energético ativo · Monitorando carregamento USB PD + portas OTG simultâneas."
-        }
-        _powerTelemetry.value = prev.copy(
-            operationMode = mode,
-            statusDetail = localHint
-        )
-        onOperationModeChanged?.invoke(mode)
-
-        val shellRes = if (engineClient.state.value.isActive) {
-            engineClient.applyHubPrivilegeMode(mode.protocolCode)
-        } else {
-            null
-        }
-        refreshPowerTelemetry(shellRes)
-        return _powerTelemetry.value
-    }
-
-    fun syncModeWithEngineIfNeeded() {
-        val mode = _powerTelemetry.value.operationMode
-        val shellRes = if (engineClient.state.value.isActive) {
-            if (mode == HubOperationMode.STANDARD) {
-                engineClient.queryUsbPortPower()
-            } else {
-                engineClient.applyHubPrivilegeMode(mode.protocolCode)
-            }
-        } else {
-            null
-        }
-        refreshPowerTelemetry(shellRes)
-    }
-
-    companion object {
-        private const val PREFS_HUB = "koda_hub_prefs"
-        private const val KEY_HUB_MODE = "hub_operation_mode"
-    }
 
     fun loadLaunchableApps() {
         val pm = context.packageManager

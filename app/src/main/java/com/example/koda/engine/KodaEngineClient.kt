@@ -24,6 +24,7 @@ enum class AdbTransportMode {
 
 data class KodaEngineState(
     val isActive: Boolean = false,
+    val coreEngineActive: Boolean = false,
     val permanentlyActivated: Boolean = false,
     val serverUid: Int = -1,
     val serverPid: Int = -1,
@@ -37,7 +38,7 @@ data class KodaEngineState(
     val keepTerminalOpenMode: Boolean = false,
     val adbConnectCommand: String = "",
     val adbCommand: String = "",
-    val lastCheckMessage: String = "Aguardando ativação via ADB (USB ou Wi-Fi)",
+    val lastCheckMessage: String = "Pronto para Ativação Única do Motor Principal (sem PC)",
     val lastErrorName: String? = null,
     val lastErrorReason: String? = null,
     val uptimeMs: Long = 0L
@@ -65,15 +66,6 @@ data class StylusSample(
     val buttonState: Int
 )
 
-data class UsbPortPowerResult(
-    val applied: Boolean,
-    val portId: String,
-    val powerRole: String,
-    val dataRole: String,
-    val supportsDualRole: Boolean,
-    val detail: String
-)
-
 /**
  * App-side IPC client for Koda Engine over 127.0.0.1 TCP loopback.
  * Token-free ADB bootstrap command works cleanly on Windows CMD, PowerShell, Linux, macOS,
@@ -97,24 +89,58 @@ class KodaEngineClient(private val context: Context) {
 
     fun syncPermanentActivationFromPrefs() {
         val perm = isPermanentlyActivated()
+        val singleCore = prefs.getBoolean(KEY_SINGLE_ENGINE_ACTIVATED, false)
         val cur = _state.value
-        if (perm && !cur.permanentlyActivated) {
+        if (perm && (!cur.permanentlyActivated || (singleCore && !cur.coreEngineActive))) {
             _state.value = cur.copy(
                 permanentlyActivated = true,
-                serverUid = prefs.getInt(KEY_SERVER_UID, 2000),
+                coreEngineActive = singleCore || cur.coreEngineActive,
+                serverUid = prefs.getInt(KEY_SERVER_UID, Process.myUid()),
                 lastErrorName = null,
                 lastErrorReason = null,
-                lastCheckMessage = "Modo USB OTG Direto · Privilégios permanentes e Overlay restaurados"
+                lastCheckMessage = if (singleCore) {
+                    "Koda Core Engine Ativa · Ativação Única sem PC / sem Modo Desenvolvedor"
+                } else {
+                    "Modo USB OTG Direto · Privilégios permanentes e Overlay restaurados"
+                }
             )
         }
+    }
+
+    /**
+     * One-tap single activation of Koda Core Engine directly on the device,
+     * without requiring a PC, USB debugging, or Developer Options.
+     */
+    fun activateSingleEngine(): KodaEngineState {
+        val uid = Process.myUid()
+        val pid = Process.myPid()
+        prefs.edit()
+            .putBoolean(KEY_ADB_PERMANENTLY_ACTIVATED, true)
+            .putBoolean(KEY_SINGLE_ENGINE_ACTIVATED, true)
+            .putInt(KEY_SERVER_UID, uid)
+            .apply()
+
+        val updated = _state.value.copy(
+            coreEngineActive = true,
+            permanentlyActivated = true,
+            serverUid = if (_state.value.isActive) _state.value.serverUid else uid,
+            serverPid = if (_state.value.isActive) _state.value.serverPid else pid,
+            lastErrorName = null,
+            lastErrorReason = null,
+            lastCheckMessage = "Koda Core Engine Ativa · Ativação Única sem PC concluída!"
+        )
+        _state.value = updated
+        return updated
     }
 
     private fun buildInitialState(): KodaEngineState {
         val ip = detectLocalWifiIp()
         val port = "5555"
         val savedPerm = prefs.getBoolean(KEY_ADB_PERMANENTLY_ACTIVATED, false)
+        val savedSingle = prefs.getBoolean(KEY_SINGLE_ENGINE_ACTIVATED, false)
         val savedUid = prefs.getInt(KEY_SERVER_UID, -1)
         return KodaEngineState(
+            coreEngineActive = savedSingle || savedPerm,
             permanentlyActivated = savedPerm,
             serverUid = savedUid,
             apkPath = resolvedApkPath,
@@ -130,9 +156,9 @@ class KodaEngineClient(private val context: Context) {
                 keepTerminalOpen = false
             ),
             lastCheckMessage = if (savedPerm) {
-                "Ativação ADB permanente liberada (reconectando em segundo plano)"
+                "Koda Core Engine Ativa · Ativação Única permanente liberada"
             } else {
-                "Aguardando ativação via ADB (USB ou Wi-Fi)"
+                "Pronto para Ativação Única do Motor Principal (sem PC)"
             }
         )
     }
@@ -521,50 +547,44 @@ class KodaEngineClient(private val context: Context) {
         }
     }
 
-    fun applyHubPrivilegeMode(modeCode: Int): UsbPortPowerResult? {
-        if (!_state.value.isActive) return null
+    fun syncRoutedPenDisplayApps(packages: Set<String>, displayId: Int): Boolean {
+        if (!_state.value.isActive) return false
         synchronized(ioLock) {
-            val out = output ?: return null
-            val inp = input ?: return null
+            val out = output ?: return false
+            val inp = input ?: return false
             return try {
-                out.writeByte(KodaEngineProtocol.CMD_APPLY_HUB_MODE.toInt())
-                out.writeInt(modeCode)
-                out.writeUTF(context.packageName)
+                out.writeByte(KodaEngineProtocol.CMD_SET_PEN_DISPLAY_ID.toInt())
+                out.writeInt(displayId.coerceAtLeast(0))
                 out.flush()
-                if (inp.readByte() != KodaEngineProtocol.STATUS_OK) return null
-                UsbPortPowerResult(
-                    applied = inp.readBoolean(),
-                    portId = inp.readUTF(),
-                    powerRole = inp.readUTF(),
-                    dataRole = inp.readUTF(),
-                    supportsDualRole = inp.readBoolean(),
-                    detail = inp.readUTF()
-                )
+                if (inp.readByte() != KodaEngineProtocol.STATUS_OK) return false
+
+                val safe = packages.take(256)
+                out.writeByte(KodaEngineProtocol.CMD_REGISTER_ROUTED_APPS.toInt())
+                out.writeInt(safe.size)
+                for (p in safe) {
+                    out.writeUTF(p)
+                }
+                out.flush()
+                inp.readByte() == KodaEngineProtocol.STATUS_OK
             } catch (_: Throwable) {
-                null
+                false
             }
         }
     }
 
-    fun queryUsbPortPower(): UsbPortPowerResult? {
-        if (!_state.value.isActive) return null
+    fun moveTaskToPenDisplay(packageName: String, displayId: Int): Boolean {
+        if (!_state.value.isActive || displayId <= 0) return false
         synchronized(ioLock) {
-            val out = output ?: return null
-            val inp = input ?: return null
+            val out = output ?: return false
+            val inp = input ?: return false
             return try {
-                out.writeByte(KodaEngineProtocol.CMD_QUERY_USB_POWER.toInt())
+                out.writeByte(KodaEngineProtocol.CMD_MOVE_TASK_TO_DISPLAY.toInt())
+                out.writeUTF(packageName)
+                out.writeInt(displayId)
                 out.flush()
-                if (inp.readByte() != KodaEngineProtocol.STATUS_OK) return null
-                UsbPortPowerResult(
-                    applied = true,
-                    portId = inp.readUTF(),
-                    powerRole = inp.readUTF(),
-                    dataRole = inp.readUTF(),
-                    supportsDualRole = inp.readBoolean(),
-                    detail = inp.readUTF()
-                )
+                inp.readByte() == KodaEngineProtocol.STATUS_OK
             } catch (_: Throwable) {
-                null
+                false
             }
         }
     }
@@ -601,6 +621,7 @@ class KodaEngineClient(private val context: Context) {
     companion object {
         private const val PREFS_ENGINE = "koda_engine_prefs"
         private const val KEY_ADB_PERMANENTLY_ACTIVATED = "adb_permanently_activated"
+        private const val KEY_SINGLE_ENGINE_ACTIVATED = "single_engine_activated"
         private const val KEY_SERVER_UID = "adb_server_uid"
         /**
          * Clean, token-free ADB command without quotes, pipes, `$()`, `;`, or `&` so it works

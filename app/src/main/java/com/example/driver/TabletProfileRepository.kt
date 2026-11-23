@@ -45,16 +45,33 @@ class TabletProfileRepository(private val context: Context) {
             }
             loadedAll = true
         }
-        return cachedProfiles.values.sortedBy {
-            if (it.id == "ugee_s640") 0 else 1
-        }
+        return cachedProfiles.values.sortedWith(
+            compareBy<TabletProfileJson> { if (it.id == "ugee_s640") 0 else 1 }
+                .thenBy { if (it.isPenDisplay) 1 else 0 }
+                .thenBy { it.name }
+        )
     }
 
-    fun findByVidPid(vendorId: Int, productId: Int): TabletProfileJson? {
+    fun getPenDisplayProfiles(): List<TabletProfileJson> =
+        getAllProfiles().filter { it.isPenDisplay }
+
+    fun findByVidPid(vendorId: Int, productId: Int, productName: String = ""): TabletProfileJson? {
         val all = getAllProfiles()
         val exact = all.firstOrNull { it.vendorId == vendorId && productId in it.productIds }
         if (exact != null) return exact
-        return all.firstOrNull { it.vendorId == vendorId }
+        val lower = productName.lowercase()
+        if (PEN_DISPLAY_NAME_HINTS.any { lower.contains(it) }) {
+            val displayByBrand = all.firstOrNull { it.isPenDisplay && it.vendorId == vendorId }
+            if (displayByBrand != null) return displayByBrand
+        }
+        return all.firstOrNull { !it.isPenDisplay && it.vendorId == vendorId }
+            ?: all.firstOrNull { it.vendorId == vendorId }
+    }
+
+    companion object {
+        val PEN_DISPLAY_NAME_HINTS = listOf(
+            "pen display", "artist", "kamvas", "cintiq", "wacom one", "ue12", "u1200", "innovator", "kanvas", "screen tablet"
+        )
     }
 
     fun getProfileById(id: String): TabletProfileJson {

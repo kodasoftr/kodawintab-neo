@@ -23,6 +23,7 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowForward
 import androidx.compose.material.icons.filled.ChevronRight
+import androidx.compose.material.icons.filled.DesktopWindows
 import androidx.compose.material.icons.filled.Draw
 import androidx.compose.material.icons.filled.Hub
 import androidx.compose.material.icons.filled.Monitor
@@ -55,7 +56,10 @@ import com.example.driver.DriverTelemetry
 import com.example.hub.HubSlotAssignment
 import com.example.hub.RoutingMode
 import com.example.koda.engine.KodaEngineState
+import com.example.pendisplay.KodaStreamTelemetry
+import com.example.pendisplay.PenDisplayState
 import com.example.ui.theme.AmberAccent
+import com.example.ui.theme.ElectricCyan
 import com.example.ui.theme.EmeraldActive
 import com.example.usb.ConnectedUsbDeviceInfo
 import java.util.Locale
@@ -67,14 +71,17 @@ fun HomeScreen(
     usbDevices: List<ConnectedUsbDeviceInfo>,
     displays: List<TargetDisplayInfo>,
     hubSlots: List<HubSlotAssignment>,
+    penDisplayState: PenDisplayState,
+    streamTelemetry: KodaStreamTelemetry,
     onOpenMesa: () -> Unit,
     onOpenHub: () -> Unit,
+    onOpenPenDisplay: () -> Unit,
     onOpenActivation: () -> Unit,
     modifier: Modifier = Modifier
 ) {
     val activeColor = when {
         engineState.isActive -> EmeraldActive
-        engineState.permanentlyActivated -> Color(0xFF00D4B4)
+        engineState.coreEngineActive || engineState.permanentlyActivated -> Color(0xFF00D4B4)
         else -> AmberAccent
     }
     val coopSlotsCount = hubSlots.count { it.routingMode == RoutingMode.COOP }
@@ -141,8 +148,8 @@ fun HomeScreen(
                         .testTag("home_engine_status_button")
                 ) {
                     Icon(
-                        imageVector = if (engineState.isActive || engineState.permanentlyActivated) Icons.Default.VerifiedUser else Icons.Default.Security,
-                        contentDescription = if (engineState.isActive || engineState.permanentlyActivated) "Ver Privilégios Permanentes" else "Ativar Koda Engine",
+                        imageVector = if (engineState.isActive || engineState.coreEngineActive || engineState.permanentlyActivated) Icons.Default.VerifiedUser else Icons.Default.Security,
+                        contentDescription = if (engineState.isActive || engineState.coreEngineActive || engineState.permanentlyActivated) "Ver Privilégios Permanentes" else "Ativar Koda Engine",
                         tint = activeColor
                     )
                 }
@@ -219,7 +226,7 @@ fun HomeScreen(
                         )
                     }
                 }
-            } else if (engineState.permanentlyActivated) {
+            } else if (engineState.coreEngineActive || engineState.permanentlyActivated) {
                 Surface(
                     color = activeColor.copy(alpha = 0.12f),
                     shape = MaterialTheme.shapes.medium,
@@ -236,12 +243,12 @@ fun HomeScreen(
                     ) {
                         Column(modifier = Modifier.weight(1f)) {
                             Text(
-                                text = "Ativação Permanente · Modo USB OTG Direto",
+                                text = "Ativação Única · Koda Core Engine Ativa",
                                 style = MaterialTheme.typography.titleMedium,
                                 color = activeColor
                             )
                             Text(
-                                text = "Ativado 1x: driver OTG e permissões seguem ativos com Desenvolvedor desligado. Toque para ver.",
+                                text = "Driver USB OTG, Pen Display Kodasoftr e Stream ativos sem PC ou Modo Desenvolvedor.",
                                 style = MaterialTheme.typography.bodyMedium,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant
                             )
@@ -274,7 +281,7 @@ fun HomeScreen(
                                 color = AmberAccent
                             )
                             Text(
-                                text = "Toque para ativar uma única vez via ADB e liberar USB OTG + sistema.",
+                                text = "Toque para ativar o Motor Principal em 1 toque (sem PC / sem Desenvolvedor).",
                                 style = MaterialTheme.typography.bodyMedium,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant
                             )
@@ -288,37 +295,63 @@ fun HomeScreen(
                 }
             }
 
-            // Two Main Primary Action Buttons (Mesa & Hub)
+            // Primary Action Cards (Mesa, Hub & Pen Display Kodasoftr)
+            val penDisplayBadge = when {
+                penDisplayState.isVirtualDisplayActive ->
+                    "Display #${penDisplayState.virtualDisplayId} · ${streamTelemetry.fps} FPS · ${penDisplayState.selectedPreset.widthPx}×${penDisplayState.selectedPreset.heightPx}"
+                penDisplayState.isPenDisplayConnected ->
+                    "${penDisplayState.autoDetectedHardwareName ?: "Pen Display USB"} · Pronta"
+                else ->
+                    "${penDisplayState.selectedPreset.widthPx}×${penDisplayState.selectedPreset.heightPx} · ${penDisplayState.selectedPreset.dpi} DPI"
+            }
+
             BoxWithConstraints(modifier = Modifier.fillMaxWidth()) {
                 val isWide = maxWidth >= 560.dp
                 if (isWide) {
-                    Row(
+                    Column(
                         modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.spacedBy(16.dp)
+                        verticalArrangement = Arrangement.spacedBy(16.dp)
                     ) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(16.dp)
+                        ) {
+                            HomePrimaryActionCard(
+                                title = "Mesa",
+                                subtitle = "Driver Global · Wacom, Huion, Ugee S640, XP-Pen",
+                                badge = "${telemetry.activeProfileName} · ${telemetry.maxNativePressure + 1} níveis",
+                                detail = "Pipeline zero-alocação, curva OTD, rotação automática e teste de latência.",
+                                icon = Icons.Default.Draw,
+                                accent = MaterialTheme.colorScheme.primary,
+                                onClick = onOpenMesa,
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .testTag("home_mesa_button")
+                            )
+                            HomePrimaryActionCard(
+                                title = "Hub",
+                                subtitle = "2 Mouses · 2 Teclados · 2 Mesas",
+                                badge = "$routedSlotsCount roteado(s) · $coopSlotsCount em Coop",
+                                detail = "Roteamento por janela, cursor .cur/.ani/.png e Modo Coop automático.",
+                                icon = Icons.Default.Hub,
+                                accent = MaterialTheme.colorScheme.secondary,
+                                onClick = onOpenHub,
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .testTag("home_hub_button")
+                            )
+                        }
                         HomePrimaryActionCard(
-                            title = "Mesa",
-                            subtitle = "Driver Global · Wacom, Huion, Ugee S640, XP-Pen",
-                            badge = "${telemetry.activeProfileName} · ${telemetry.maxNativePressure + 1} níveis",
-                            detail = "Pipeline zero-alocação, curva OTD, rotação automática e teste de latência.",
-                            icon = Icons.Default.Draw,
-                            accent = MaterialTheme.colorScheme.primary,
-                            onClick = onOpenMesa,
+                            title = "Mesa com Tela",
+                            subtitle = "Pen Display · Kodasoftr Desktop & Koda Stream",
+                            badge = penDisplayBadge,
+                            detail = "Display Virtual isolado, captura MediaCodec + bulkTransfer USB, App Router e caneta 8192.",
+                            icon = Icons.Default.DesktopWindows,
+                            accent = ElectricCyan,
+                            onClick = onOpenPenDisplay,
                             modifier = Modifier
-                                .weight(1f)
-                                .testTag("home_mesa_button")
-                        )
-                        HomePrimaryActionCard(
-                            title = "Hub",
-                            subtitle = "2 Mouses · 2 Teclados · 2 Mesas",
-                            badge = "$routedSlotsCount roteado(s) · $coopSlotsCount em Coop",
-                            detail = "Roteamento por janela, cursor .cur/.ani/.png e Modo Coop automático.",
-                            icon = Icons.Default.Hub,
-                            accent = MaterialTheme.colorScheme.secondary,
-                            onClick = onOpenHub,
-                            modifier = Modifier
-                                .weight(1f)
-                                .testTag("home_hub_button")
+                                .fillMaxWidth()
+                                .testTag("home_pen_display_button")
                         )
                     }
                 } else {
@@ -326,6 +359,18 @@ fun HomeScreen(
                         modifier = Modifier.fillMaxWidth(),
                         verticalArrangement = Arrangement.spacedBy(16.dp)
                     ) {
+                        HomePrimaryActionCard(
+                            title = "Mesa com Tela",
+                            subtitle = "Pen Display · Kodasoftr Desktop & Koda Stream",
+                            badge = penDisplayBadge,
+                            detail = "Display Virtual isolado, captura MediaCodec + bulkTransfer USB, App Router e caneta 8192.",
+                            icon = Icons.Default.DesktopWindows,
+                            accent = ElectricCyan,
+                            onClick = onOpenPenDisplay,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .testTag("home_pen_display_button")
+                        )
                         HomePrimaryActionCard(
                             title = "Mesa",
                             subtitle = "Driver Global · Wacom, Huion, Ugee S640, XP-Pen",

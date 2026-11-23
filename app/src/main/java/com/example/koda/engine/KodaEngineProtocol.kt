@@ -15,13 +15,10 @@ object KodaEngineProtocol {
     const val CMD_SET_POINTER_ICON: Byte = 0x09
     const val CMD_HIDE_NATIVE_POINTER: Byte = 0x0A
     const val CMD_POLL_GLOBAL_POINTER: Byte = 0x0B
-    const val CMD_APPLY_HUB_MODE: Byte = 0x0C
-    const val CMD_QUERY_USB_POWER: Byte = 0x0D
+    const val CMD_REGISTER_ROUTED_APPS: Byte = 0x0C
+    const val CMD_MOVE_TASK_TO_DISPLAY: Byte = 0x0D
+    const val CMD_SET_PEN_DISPLAY_ID: Byte = 0x0E
     const val CMD_SHUTDOWN: Byte = 0x7F
-
-    const val HUB_MODE_STANDARD = 0
-    const val HUB_MODE_MULTI_3PLUS = 1
-    const val HUB_MODE_ENERGETIC_PD = 2
 
     const val STATUS_OK: Byte = 0x00
     const val STATUS_ERR_AUTH: Byte = 0x01

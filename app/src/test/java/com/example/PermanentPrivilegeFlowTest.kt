@@ -7,7 +7,6 @@ import androidx.compose.ui.test.junit4.createAndroidComposeRule
 import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performScrollTo
-import androidx.compose.ui.test.performScrollToNode
 import androidx.test.core.app.ApplicationProvider
 import com.example.koda.engine.KodaEngineClient
 import com.example.service.KodaHubForegroundService
@@ -84,28 +83,5 @@ class PermanentPrivilegeFlowTest {
         composeTestRule.onNodeWithTag("home_otg_permanent_banner").performScrollTo().performClick()
         composeTestRule.waitForIdle()
         composeTestRule.onNodeWithTag("privilege_status_screen").assertIsDisplayed()
-
-        // Test expanded 1-time ADB Hub privilege buttons inside PrivilegeStatusScreen
-        composeTestRule.onNodeWithTag("priv_apply_multi_3plus_button").performScrollTo().performClick()
-        composeTestRule.waitForIdle()
-        composeTestRule.onNodeWithTag("priv_apply_energetic_button").performScrollTo().performClick()
-        composeTestRule.waitForIdle()
-
-        // Navigate back to Home -> HubScreen and verify HubOperationModesCard mode switches cleanly
-        composeTestRule.onNodeWithTag("privileges_back_button").performClick()
-        composeTestRule.waitForIdle()
-        composeTestRule.onNodeWithTag("home_hub_button").performScrollTo().performClick()
-        composeTestRule.waitForIdle()
-
-        composeTestRule.onNodeWithTag("hub_lazy_column")
-            .performScrollToNode(hasTestTag("hub_operation_modes_card"))
-        composeTestRule.waitForIdle()
-
-        composeTestRule.onNodeWithTag("hub_mode_multi_3plus").performClick()
-        composeTestRule.waitForIdle()
-        composeTestRule.onNodeWithTag("hub_mode_energetic").performClick()
-        composeTestRule.waitForIdle()
-        composeTestRule.onNodeWithTag("hub_mode_standard").performClick()
-        composeTestRule.waitForIdle()
     }
 }

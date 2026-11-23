@@ -21,7 +21,6 @@ import com.example.driver.TabletPipeline
 import com.example.driver.TabletProfileJson
 import com.example.driver.TabletProfileRepository
 import com.example.driver.TabletSlotId
-import com.example.hub.HubOperationMode
 import com.example.koda.engine.KodaEngineClient
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -47,7 +46,8 @@ data class ConnectedUsbDeviceInfo(
     val isClaimed: Boolean,
     val matchedProfileId: String?,
     val vbusActive: Boolean = true,
-    val isSystemInputFallback: Boolean = false
+    val isSystemInputFallback: Boolean = false,
+    val isPenDisplay: Boolean = false
 )
 
 /**
@@ -71,12 +71,20 @@ class UsbTabletCoordinator(
     private val _lastUsbEventLog = MutableStateFlow("Aguardando dispositivos USB OTG...")
     val lastUsbEventLog: StateFlow<String> = _lastUsbEventLog.asStateFlow()
 
+    private val _penDisplayConnected = MutableStateFlow(false)
+    val penDisplayConnected: StateFlow<Boolean> = _penDisplayConnected.asStateFlow()
+
+    private val _detectedPenDisplayProfile = MutableStateFlow<TabletProfileJson?>(null)
+    val detectedPenDisplayProfile: StateFlow<TabletProfileJson?> = _detectedPenDisplayProfile.asStateFlow()
+
+    @Volatile private var activeVideoConnection: UsbDeviceConnection? = null
+    @Volatile private var activeVideoBulkOutEndpoint: UsbEndpoint? = null
+
     @Volatile var onMouseCoordinate: ((x: Float, y: Float, isVisible: Boolean, channel: Int) -> Unit)? = null
     @Volatile var resolveCursorChannel: ((deviceKey: String) -> Int)? = null
     @Volatile var mouseDisplayWidthPx: Float = 1080f
     @Volatile var mouseDisplayHeightPx: Float = 2400f
     @Volatile var mouseSensitivity: Float = 1.0f
-    @Volatile var hubOperationMode: HubOperationMode = HubOperationMode.STANDARD
 
     private var mouseCursorX = 540f
     private var mouseCursorY = 960f
@@ -176,7 +184,7 @@ class UsbTabletCoordinator(
             context,
             usbReceiver,
             filter,
-            ContextCompat.RECEIVER_EXPORTED
+            ContextCompat.RECEIVER_NOT_EXPORTED
         )
         runCatching { inputManager?.registerInputDeviceListener(inputDeviceListener, null) }
         receiverRegistered = true
@@ -225,8 +233,11 @@ class UsbTabletCoordinator(
                     openAndClaimDevice(dev, TabletSlotId.MESA_1)
                 }
                 val matched = if (kind == UsbPeripheralKind.TABLET) {
-                    profileRepo.findByVidPid(dev.vendorId, dev.productId)
+                    profileRepo.findByVidPid(dev.vendorId, dev.productId, dev.productName.orEmpty())
                 } else null
+                val nameLower = "${dev.productName.orEmpty()} ${dev.manufacturerName.orEmpty()}".lowercase()
+                val isPenDisp = (matched?.isPenDisplay == true) ||
+                    TabletProfileRepository.PEN_DISPLAY_NAME_HINTS.any { nameLower.contains(it) }
 
                 seenVidPids.add("${dev.vendorId}:${dev.productId}")
                 result.add(
@@ -241,7 +252,8 @@ class UsbTabletCoordinator(
                         hasPermission = mgr.hasPermission(dev),
                         isClaimed = activeConnections.containsKey(key),
                         matchedProfileId = matched?.id,
-                        isSystemInputFallback = false
+                        isSystemInputFallback = false,
+                        isPenDisplay = isPenDisp
                     )
                 )
             }
@@ -263,6 +275,13 @@ class UsbTabletCoordinator(
                     result.any { it.vendorId == inDev.vendorId && it.productId == inDev.productId && it.kind == kind }
                 if (alreadyListed) continue
 
+                val matchedInput = if (kind == UsbPeripheralKind.TABLET) {
+                    profileRepo.findByVidPid(inDev.vendorId, inDev.productId, inDev.name)
+                } else null
+                val inputNameLower = inDev.name.lowercase()
+                val isInputPenDisp = (matchedInput?.isPenDisplay == true) ||
+                    TabletProfileRepository.PEN_DISPLAY_NAME_HINTS.any { inputNameLower.contains(it) }
+
                 val key = "INPUT:${hexId(inDev.vendorId)}:${hexId(inDev.productId)}:${inDev.id}"
                 result.add(
                     ConnectedUsbDeviceInfo(
@@ -275,14 +294,25 @@ class UsbTabletCoordinator(
                         kind = kind,
                         hasPermission = true,
                         isClaimed = false,
-                        matchedProfileId = null,
-                        isSystemInputFallback = true
+                        matchedProfileId = matchedInput?.id,
+                        isSystemInputFallback = true,
+                        isPenDisplay = isInputPenDisp
                     )
                 )
             }
         }
 
         _devices.value = result
+        val penDisplayDev = result.firstOrNull { it.isPenDisplay }
+        if (penDisplayDev != null) {
+            _penDisplayConnected.value = true
+            _detectedPenDisplayProfile.value = penDisplayDev.matchedProfileId?.let {
+                profileRepo.getProfileById(it)
+            } ?: profileRepo.findByVidPid(penDisplayDev.vendorId, penDisplayDev.productId, penDisplayDev.productName)
+        } else {
+            _penDisplayConnected.value = false
+            _detectedPenDisplayProfile.value = null
+        }
     }
 
     private fun isExternalInputDevice(dev: InputDevice): Boolean {
@@ -345,8 +375,7 @@ class UsbTabletCoordinator(
         } else {
             PendingIntent.FLAG_UPDATE_CURRENT
         }
-        val permIntent = Intent(ACTION_USB_PERMISSION).setPackage(context.packageName)
-        val pi = PendingIntent.getBroadcast(context, device.deviceId, permIntent, flags)
+        val pi = PendingIntent.getBroadcast(context, device.deviceId, Intent(ACTION_USB_PERMISSION), flags)
         mgr.requestPermission(device, pi)
     }
 
@@ -362,7 +391,7 @@ class UsbTabletCoordinator(
         if (activeConnections.containsKey(key)) return
 
         val matchedProfile = if (kind == UsbPeripheralKind.TABLET) {
-            profileRepo.findByVidPid(device.vendorId, device.productId)
+            profileRepo.findByVidPid(device.vendorId, device.productId, device.productName.orEmpty())
         } else null
 
         val targetIntf = selectBestHidInterface(device, matchedProfile, kind) ?: run {
@@ -390,6 +419,14 @@ class UsbTabletCoordinator(
             runVendorInitialization(connection, matchedProfile)
         }
 
+        // Detect optional vendor bulk-out endpoint for proprietary Koda Stream Engine USB video frames
+        findVendorVideoBulkOutEndpoint(device)?.let { (videoIntf, bulkEp) ->
+            if (videoIntf == targetIntf || connection.claimInterface(videoIntf, true)) {
+                activeVideoConnection = connection
+                activeVideoBulkOutEndpoint = bulkEp
+            }
+        }
+
         val endpoint = findInterruptInEndpoint(targetIntf, matchedProfile)
         if (endpoint == null) {
             connection.releaseInterface(targetIntf)
@@ -404,6 +441,35 @@ class UsbTabletCoordinator(
             startTabletReaderSession(device, key, connection, targetIntf, endpoint, matchedProfile, targetSlot, kind)
         }
     }
+
+    private fun findVendorVideoBulkOutEndpoint(device: UsbDevice): Pair<UsbInterface, UsbEndpoint>? {
+        for (i in 0 until device.interfaceCount) {
+            val intf = device.getInterface(i)
+            if (isAdbOrNonInputInterface(intf)) continue
+            if (intf.interfaceClass == UsbConstants.USB_CLASS_VENDOR_SPEC) {
+                for (e in 0 until intf.endpointCount) {
+                    val ep = intf.getEndpoint(e)
+                    if (ep.type == UsbConstants.USB_ENDPOINT_XFER_BULK &&
+                        ep.direction == UsbConstants.USB_DIR_OUT
+                    ) {
+                        return intf to ep
+                    }
+                }
+            }
+        }
+        return null
+    }
+
+    fun sendVideoFrameBulk(packet: ByteArray, length: Int): Boolean {
+        val conn = activeVideoConnection ?: return false
+        val ep = activeVideoBulkOutEndpoint ?: return false
+        return runCatching {
+            conn.bulkTransfer(ep, packet, length.coerceAtMost(packet.size), 12) >= 0
+        }.getOrDefault(false)
+    }
+
+    fun hasUsbVideoBulkTransport(): Boolean =
+        activeVideoConnection != null && activeVideoBulkOutEndpoint != null
 
     private fun startMouseReaderSession(
         device: UsbDevice,
@@ -421,8 +487,7 @@ class UsbTabletCoordinator(
             Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_DISPLAY)
             val buffer = ByteArray(packetSize)
             while (running.get()) {
-                val transferTimeoutMs = if (hubOperationMode == HubOperationMode.MULTI_PERIPHERAL_3PLUS) 12 else 32
-                val bytesRead = connection.bulkTransfer(endpoint, buffer, packetSize, transferTimeoutMs)
+                val bytesRead = connection.bulkTransfer(endpoint, buffer, packetSize, 40)
                 if (bytesRead > 0 && mouseParser.parse(buffer, bytesRead, mouseSensitivity)) {
                     val channel = resolveCursorChannel?.invoke(key) ?: 1
                     val curX: Float
@@ -502,8 +567,7 @@ class UsbTabletCoordinator(
             Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_DISPLAY)
             val preAllocBuffer = ByteArray(packetSize)
             while (running.get()) {
-                val transferTimeoutMs = if (hubOperationMode == HubOperationMode.MULTI_PERIPHERAL_3PLUS) 16 else 40
-                val bytesRead = connection.bulkTransfer(endpoint, preAllocBuffer, packetSize, transferTimeoutMs)
+                val bytesRead = connection.bulkTransfer(endpoint, preAllocBuffer, packetSize, 50)
                 if (bytesRead > 0) {
                     pipeline.ringBuffer.offer(preAllocBuffer, bytesRead, System.nanoTime())
                     pipeline.wakeWorker()
@@ -605,6 +669,10 @@ class UsbTabletCoordinator(
         val session = activeConnections.remove(deviceKey) ?: return
         session.running.set(false)
         session.thread.interrupt()
+        if (activeVideoConnection == session.connection) {
+            activeVideoConnection = null
+            activeVideoBulkOutEndpoint = null
+        }
         runCatching {
             session.connection.releaseInterface(session.usbInterface)
             session.connection.close()

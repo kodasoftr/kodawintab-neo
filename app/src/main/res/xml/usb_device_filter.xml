@@ -13,6 +13,12 @@
     <usb-device vendor-id="8569" />
     <!-- Waltop (VID 0x172F = 5935) -->
     <usb-device vendor-id="5935" />
+    <!-- UC-Logic / Genius (VID 0x5543 = 21827) -->
+    <usb-device vendor-id="21827" />
+    <!-- Hanvon (VID 0x0B57 = 2903) -->
+    <usb-device vendor-id="2903" />
+    <!-- Bosto / Artisul (VID 0x21A9 = 8617) -->
+    <usb-device vendor-id="8617" />
     <!-- Digitizer HID dedicado (subclass=0, protocol=0) — não intercepta boot mouse (protocol=2) nem boot teclado (protocol=1) nem ADB -->
     <usb-device class="3" subclass="0" protocol="0" />
 </resources>

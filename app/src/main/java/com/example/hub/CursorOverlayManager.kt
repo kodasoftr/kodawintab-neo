@@ -12,6 +12,10 @@ import android.provider.Settings
 import android.view.Gravity
 import android.view.View
 import android.view.WindowManager
+import com.example.display.TargetDisplayInfo
+import com.example.driver.CoordinateMatrix
+import com.example.driver.TabletConfig
+import com.example.driver.TabletProfileJson
 import com.example.koda.engine.GlobalPointerSample
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -49,6 +53,7 @@ data class CursorOverlaySnapshot(
     val currentFrameIndex: Int = 0,
     val currentChannel2FrameIndex: Int = 0,
     val overlayPermissionGranted: Boolean = false,
+    val accessibilityServiceEnabled: Boolean = false,
     val nativeCursorApplied: Boolean = false,
     val nativePointerHidden: Boolean = false
 )
@@ -67,7 +72,10 @@ class CursorOverlayManager(private val context: Context) {
 
     private val prefs = context.getSharedPreferences(PREFS_CURSORS, Context.MODE_PRIVATE)
     private val mainHandler = Handler(Looper.getMainLooper())
-    private val windowManager = context.getSystemService(Context.WINDOW_SERVICE) as? WindowManager
+    private val systemWindowManager = context.getSystemService(Context.WINDOW_SERVICE) as? WindowManager
+    @Volatile private var accessibilityWindowManager: WindowManager? = null
+    @Volatile private var activeWindowManagerType: Int = WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
+    private val builtInDefaultCursor: DecodedCursor = CursorDecoder.createDefaultKodaCursor()
 
     private val _snapshot = MutableStateFlow(
         CursorOverlaySnapshot(
@@ -77,8 +85,11 @@ class CursorOverlayManager(private val context: Context) {
                         ?: CursorRenderMode.SIMULATED.name
                 )
             }.getOrDefault(CursorRenderMode.SIMULATED),
+            activeCursor = builtInDefaultCursor,
+            channel1Cursor = builtInDefaultCursor,
             cursorScale = prefs.getFloat(KEY_CURSOR_SCALE, 1.0f).coerceIn(0.5f, 2.5f),
-            overlayPermissionGranted = runCatching { Settings.canDrawOverlays(context) }.getOrDefault(false)
+            overlayPermissionGranted = runCatching { Settings.canDrawOverlays(context) }.getOrDefault(false),
+            accessibilityServiceEnabled = KodaAccessibilityService.isEnabledInSettings(context)
         )
     )
     val snapshot: StateFlow<CursorOverlaySnapshot> = _snapshot.asStateFlow()
@@ -93,47 +104,124 @@ class CursorOverlayManager(private val context: Context) {
     @Volatile private var overlayParams2: WindowManager.LayoutParams? = null
     @Volatile private var attached2 = false
 
+    private val syncedTabletMatrix = CoordinateMatrix()
+    private val scratchMatrixXY = FloatArray(2)
+    @Volatile private var hasSyncedMatrix = false
+
     private val syncScheduled = AtomicBoolean(false)
     private var aniTickRunnable: Runnable? = null
     private var lastGlobalSeq = 0L
     private var lastHideDispatched: Boolean? = null
     @Volatile private var lastOverlayPermCheckMs = 0L
+    @Volatile private var lastOverlaySyncMs = 0L
+    @Volatile private var ownAppForeground = false
+    @Volatile private var calibrationSuppressed = false
 
     private val syncRunnable = Runnable {
         syncScheduled.set(false)
         applySystemOverlaysOnMain()
     }
 
-    fun refreshOverlayPermission() {
-        val granted = runCatching { Settings.canDrawOverlays(context) }.getOrDefault(false)
-        lastOverlayPermCheckMs = SystemClock.uptimeMillis()
-        if (_snapshot.value.overlayPermissionGranted != granted) {
-            _snapshot.value = _snapshot.value.copy(overlayPermissionGranted = granted)
+    fun setOwnAppForeground(inForeground: Boolean) {
+        if (ownAppForeground == inForeground) return
+        ownAppForeground = inForeground
+        forceImmediateOverlaySync()
+    }
+
+    fun setCalibrationSuppressed(suppressed: Boolean) {
+        if (calibrationSuppressed == suppressed) return
+        calibrationSuppressed = suppressed
+        forceImmediateOverlaySync()
+    }
+
+    fun isCalibrationSuppressed(): Boolean = calibrationSuppressed
+
+    fun attachAccessibilityWindowManager(wm: WindowManager?) {
+        val changed = (accessibilityWindowManager == null) != (wm == null)
+        accessibilityWindowManager = wm
+        if (changed) {
+            mainHandler.post {
+                detachAllOverlaysSync()
+                refreshOverlayPermission()
+            }
         }
-        scheduleOverlaySync()
+    }
+
+    fun syncTabletMatrixConfig(
+        config: TabletConfig,
+        profile: TabletProfileJson,
+        display: TargetDisplayInfo
+    ) {
+        val effRot = display.rotationDeg
+        syncedTabletMatrix.rebuild(
+            tabletMaxX = profile.maxX,
+            tabletMaxY = profile.maxY,
+            activeArea = config.activeArea,
+            screenArea = config.screenArea,
+            displayWidthPx = display.widthPx.toFloat(),
+            displayHeightPx = display.heightPx.toFloat(),
+            manualRotationDeg = config.manualRotationDeg,
+            autoRotation = config.autoRotation,
+            displayRotationDeg = effRot,
+            invertX = config.invertX,
+            invertY = config.invertY,
+            rotateAxesWithScreen = config.rotateTabletAxesWithScreen,
+            lockAspectRatio = config.lockAspectRatio,
+            dpiMode = config.dpiMode,
+            targetDpiX = if (config.dpiMode == com.example.driver.DpiNormalizationMode.MANUAL) config.manualDpiX.toFloat() else display.xdpi,
+            targetDpiY = if (config.dpiMode == com.example.driver.DpiNormalizationMode.MANUAL) config.manualDpiY.toFloat() else display.ydpi,
+            tabletWidthMm = profile.widthMm,
+            tabletHeightMm = profile.heightMm
+        )
+        hasSyncedMatrix = true
+        setTabletRotationConfig(
+            autoRotateWithScreen = config.autoRotation && config.rotateTabletAxesWithScreen,
+            manualRotationDeg = config.manualRotationDeg
+        )
+        updateDisplayBounds(
+            widthPx = display.widthPx.toFloat(),
+            heightPx = display.heightPx.toFloat(),
+            rotationDeg = effRot
+        )
+    }
+
+    fun refreshOverlayPermission() {
+        val appOverlay = runCatching { Settings.canDrawOverlays(context) }.getOrDefault(false)
+        val a11yRunning = KodaAccessibilityService.isServiceRunning.value ||
+            KodaAccessibilityService.isEnabledInSettings(context)
+        val granted = appOverlay || accessibilityWindowManager != null
+        lastOverlayPermCheckMs = SystemClock.uptimeMillis()
+        val cur = _snapshot.value
+        if (cur.overlayPermissionGranted != granted || cur.accessibilityServiceEnabled != a11yRunning) {
+            _snapshot.value = cur.copy(
+                overlayPermissionGranted = granted,
+                accessibilityServiceEnabled = a11yRunning
+            )
+        }
+        forceImmediateOverlaySync()
     }
 
     fun setRenderMode(mode: CursorRenderMode) {
         prefs.edit().putString(KEY_RENDER_MODE, mode.name).apply()
         _snapshot.value = _snapshot.value.copy(mode = mode)
-        scheduleOverlaySync()
+        forceImmediateOverlaySync()
     }
 
     fun setCursorScale(scale: Float) {
         val safe = scale.coerceIn(0.5f, 2.5f)
         prefs.edit().putFloat(KEY_CURSOR_SCALE, safe).apply()
         _snapshot.value = _snapshot.value.copy(cursorScale = safe)
-        scheduleOverlaySync()
+        forceImmediateOverlaySync()
     }
 
     fun setPaused(paused: Boolean) {
         _snapshot.value = _snapshot.value.copy(isPaused = paused)
-        scheduleOverlaySync()
+        forceImmediateOverlaySync()
     }
 
     fun setNativeHookApplied(applied: Boolean) {
         _snapshot.value = _snapshot.value.copy(nativeCursorApplied = applied)
-        scheduleOverlaySync()
+        forceImmediateOverlaySync()
     }
 
     /**
@@ -146,26 +234,27 @@ class CursorOverlayManager(private val context: Context) {
     fun setChannelCursor(channel: Int, cursor: DecodedCursor?) {
         val cur = _snapshot.value
         val updated = if (channel == 2) {
-            val resolvedActive = if (cur.activeChannel == 2) (cursor ?: cur.channel1Cursor) else (cur.channel1Cursor ?: cursor)
+            val resolvedActive = if (cur.activeChannel == 2) (cursor ?: cur.channel1Cursor ?: builtInDefaultCursor) else (cur.channel1Cursor ?: cursor ?: builtInDefaultCursor)
             cur.copy(
                 channel2Cursor = cursor,
                 activeCursor = resolvedActive,
                 currentChannel2FrameIndex = 0,
-                isChannel2Visible = cursor != null || cur.isChannel2Visible,
+                isChannel2Visible = cursor != null && cur.isChannel2Visible,
                 isVisible = resolvedActive != null || cur.isVisible
             )
         } else {
-            val resolvedActive = cursor ?: cur.channel2Cursor
+            val effectiveCh1 = cursor ?: builtInDefaultCursor
+            val resolvedActive = effectiveCh1
             cur.copy(
-                channel1Cursor = cursor,
+                channel1Cursor = effectiveCh1,
                 activeCursor = resolvedActive,
                 currentFrameIndex = 0,
-                isVisible = resolvedActive != null || cur.isVisible
+                isVisible = true
             )
         }
         _snapshot.value = updated
         restartAniTickerIfNeeded()
-        scheduleOverlaySync()
+        forceImmediateOverlaySync()
     }
 
     fun persistCursorForChannel(channel: Int, cursor: DecodedCursor?, rawBytes: ByteArray?) {
@@ -340,33 +429,39 @@ class CursorOverlayManager(private val context: Context) {
         val nextX: Float
         val nextY: Float
         if (sample.hasAbs) {
-            val effRot = if (tabletAutoRotateWithScreen || !sample.isStylus) {
-                (((displayRotationDeg - tabletManualRotationDeg) % 360) + 360) % 360
+            if (hasSyncedMatrix) {
+                syncedTabletMatrix.transformNormalized(sample.absXNorm, sample.absYNorm, scratchMatrixXY)
+                nextX = scratchMatrixXY[0].coerceIn(0f, w)
+                nextY = scratchMatrixXY[1].coerceIn(0f, h)
             } else {
-                ((360 - tabletManualRotationDeg) % 360 + 360) % 360
+                val effRot = if (tabletAutoRotateWithScreen || !sample.isStylus) {
+                    (((displayRotationDeg - tabletManualRotationDeg) % 360) + 360) % 360
+                } else {
+                    ((360 - tabletManualRotationDeg) % 360 + 360) % 360
+                }
+                val rotNormX: Float
+                val rotNormY: Float
+                when (effRot) {
+                    90 -> {
+                        rotNormX = sample.absYNorm
+                        rotNormY = 1f - sample.absXNorm
+                    }
+                    180 -> {
+                        rotNormX = 1f - sample.absXNorm
+                        rotNormY = 1f - sample.absYNorm
+                    }
+                    270 -> {
+                        rotNormX = 1f - sample.absYNorm
+                        rotNormY = sample.absXNorm
+                    }
+                    else -> {
+                        rotNormX = sample.absXNorm
+                        rotNormY = sample.absYNorm
+                    }
+                }
+                nextX = (rotNormX * w).coerceIn(0f, w)
+                nextY = (rotNormY * h).coerceIn(0f, h)
             }
-            val rotNormX: Float
-            val rotNormY: Float
-            when (effRot) {
-                90 -> {
-                    rotNormX = sample.absYNorm
-                    rotNormY = 1f - sample.absXNorm
-                }
-                180 -> {
-                    rotNormX = 1f - sample.absXNorm
-                    rotNormY = 1f - sample.absYNorm
-                }
-                270 -> {
-                    rotNormX = 1f - sample.absYNorm
-                    rotNormY = sample.absXNorm
-                }
-                else -> {
-                    rotNormX = sample.absXNorm
-                    rotNormY = sample.absYNorm
-                }
-            }
-            nextX = (rotNormX * w).coerceIn(0f, w)
-            nextY = (rotNormY * h).coerceIn(0f, h)
         } else {
             nextX = (cur.cursorX + sample.deltaX).coerceIn(0f, w)
             nextY = (cur.cursorY + sample.deltaY).coerceIn(0f, h)
@@ -383,8 +478,20 @@ class CursorOverlayManager(private val context: Context) {
 
     private fun scheduleOverlaySync() {
         if (syncScheduled.compareAndSet(false, true)) {
-            mainHandler.post(syncRunnable)
+            val elapsed = SystemClock.uptimeMillis() - lastOverlaySyncMs
+            if (elapsed >= 11L) {
+                mainHandler.post(syncRunnable)
+            } else {
+                mainHandler.postDelayed(syncRunnable, (11L - elapsed).coerceAtLeast(1L))
+            }
         }
+    }
+
+    private fun forceImmediateOverlaySync() {
+        mainHandler.removeCallbacks(syncRunnable)
+        syncScheduled.set(true)
+        lastOverlaySyncMs = 0L
+        mainHandler.post(syncRunnable)
     }
 
     private fun restartAniTickerIfNeeded() {
@@ -427,49 +534,75 @@ class CursorOverlayManager(private val context: Context) {
     private fun applySystemOverlaysOnMain() {
         var snap = _snapshot.value
         val nowMs = SystemClock.uptimeMillis()
+        lastOverlaySyncMs = nowMs
+        val a11yWm = accessibilityWindowManager
         val canDraw = if (lastOverlayPermCheckMs == 0L || nowMs - lastOverlayPermCheckMs >= 2500L) {
             lastOverlayPermCheckMs = nowMs
-            val fresh = runCatching { Settings.canDrawOverlays(context) }.getOrDefault(snap.overlayPermissionGranted)
-            if (fresh != snap.overlayPermissionGranted) {
-                snap = snap.copy(overlayPermissionGranted = fresh)
+            val appPerm = runCatching { Settings.canDrawOverlays(context) }.getOrDefault(false)
+            val fresh = appPerm || a11yWm != null
+            val a11yEnabled = a11yWm != null || KodaAccessibilityService.isEnabledInSettings(context)
+            if (fresh != snap.overlayPermissionGranted || a11yEnabled != snap.accessibilityServiceEnabled) {
+                snap = snap.copy(overlayPermissionGranted = fresh, accessibilityServiceEnabled = a11yEnabled)
                 _snapshot.value = snap
             }
             fresh
         } else {
-            snap.overlayPermissionGranted
+            snap.overlayPermissionGranted || a11yWm != null
         }
 
         val ch1Cursor = snap.channel1Cursor ?: snap.activeCursor
         val ch2Cursor = snap.channel2Cursor
+        val suppressBuiltinCh1InApp = ownAppForeground && ch1Cursor?.sourceFormat == "KODA"
+        val suppressBuiltinCh2InApp = ownAppForeground && ch2Cursor?.sourceFormat == "KODA"
 
-        // Hide native OS Android cursor globally whenever our custom cursor overlay is active
-        val shouldHideNative = canDraw &&
+        val showWin1 = canDraw &&
+            !calibrationSuppressed &&
+            !suppressBuiltinCh1InApp &&
             ch1Cursor != null &&
             !snap.isPaused &&
-            snap.mode == CursorRenderMode.SIMULATED
+            snap.isVisible &&
+            (snap.mode == CursorRenderMode.SIMULATED || snap.isFromTablet || !snap.nativeCursorApplied)
+
+        val showWin2 = canDraw &&
+            !calibrationSuppressed &&
+            !suppressBuiltinCh2InApp &&
+            ch2Cursor != null &&
+            !snap.isPaused &&
+            snap.isChannel2Visible &&
+            (snap.mode == CursorRenderMode.SIMULATED || snap.isFromTablet || !snap.nativeCursorApplied)
+
+        // Hide native OS Android cursor globally whenever our custom cursor overlay is active or during calibration
+        val shouldHideNative = !snap.isPaused &&
+            (calibrationSuppressed ||
+                ((ch1Cursor != null || ch2Cursor != null) &&
+                    (snap.mode == CursorRenderMode.SIMULATED || showWin1 || showWin2)))
         if (lastHideDispatched != shouldHideNative) {
             lastHideDispatched = shouldHideNative
             _snapshot.value = _snapshot.value.copy(nativePointerHidden = shouldHideNative)
             onNativePointerHideChanged?.invoke(shouldHideNative)
         }
 
-        val wm = windowManager ?: return
-
-        val showWin1 = canDraw &&
-            ch1Cursor != null &&
-            !snap.isPaused &&
-            snap.isVisible &&
-            (snap.mode == CursorRenderMode.SIMULATED || snap.isFromTablet || !snap.nativeCursorApplied)
+        val targetWm = a11yWm ?: systemWindowManager ?: return
+        val targetWinType = if (a11yWm != null) {
+            WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY
+        } else {
+            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
+        }
+        if (targetWinType != activeWindowManagerType) {
+            detachAllOverlaysSync()
+            activeWindowManagerType = targetWinType
+        }
 
         if (!showWin1) {
             if (attached1 && overlayView1 != null) {
-                runCatching { wm.removeViewImmediate(overlayView1) }
+                runCatching { targetWm.removeViewImmediate(overlayView1) }
                 attached1 = false
             }
         } else {
             val bmp1 = ch1Cursor.frames.getOrNull(snap.currentFrameIndex) ?: ch1Cursor.bitmap
             renderOrUpdateOverlayWindow(
-                wm = wm,
+                wm = targetWm,
+                windowType = targetWinType,
                 cursor = ch1Cursor,
                 bmp = bmp1,
                 scale = snap.cursorScale,
@@ -487,21 +620,16 @@ class CursorOverlayManager(private val context: Context) {
             )
         }
 
-        val showWin2 = canDraw &&
-            ch2Cursor != null &&
-            !snap.isPaused &&
-            snap.isChannel2Visible &&
-            (snap.mode == CursorRenderMode.SIMULATED || snap.isFromTablet || !snap.nativeCursorApplied)
-
         if (!showWin2) {
             if (attached2 && overlayView2 != null) {
-                runCatching { wm.removeViewImmediate(overlayView2) }
+                runCatching { targetWm.removeViewImmediate(overlayView2) }
                 attached2 = false
             }
         } else {
             val bmp2 = ch2Cursor.frames.getOrNull(snap.currentChannel2FrameIndex) ?: ch2Cursor.bitmap
             renderOrUpdateOverlayWindow(
-                wm = wm,
+                wm = targetWm,
+                windowType = targetWinType,
                 cursor = ch2Cursor,
                 bmp = bmp2,
                 scale = snap.cursorScale,
@@ -522,6 +650,7 @@ class CursorOverlayManager(private val context: Context) {
 
     private fun renderOrUpdateOverlayWindow(
         wm: WindowManager,
+        windowType: Int,
         cursor: DecodedCursor,
         bmp: android.graphics.Bitmap,
         scale: Float,
@@ -544,7 +673,7 @@ class CursorOverlayManager(private val context: Context) {
             val params = WindowManager.LayoutParams(
                 drawW,
                 drawH,
-                WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+                windowType,
                 WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
                     WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
                     WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
@@ -581,6 +710,20 @@ class CursorOverlayManager(private val context: Context) {
         }
     }
 
+    private fun detachAllOverlaysSync() {
+        val wm = accessibilityWindowManager ?: systemWindowManager
+        if (attached1 && overlayView1 != null) {
+            runCatching { wm?.removeViewImmediate(overlayView1) }
+            runCatching { systemWindowManager?.removeViewImmediate(overlayView1) }
+        }
+        if (attached2 && overlayView2 != null) {
+            runCatching { wm?.removeViewImmediate(overlayView2) }
+            runCatching { systemWindowManager?.removeViewImmediate(overlayView2) }
+        }
+        attached1 = false
+        attached2 = false
+    }
+
     fun destroy() {
         aniTickRunnable?.let { mainHandler.removeCallbacks(it) }
         aniTickRunnable = null
@@ -591,14 +734,7 @@ class CursorOverlayManager(private val context: Context) {
             onNativePointerHideChanged?.invoke(false)
         }
         mainHandler.post {
-            if (attached1 && overlayView1 != null) {
-                runCatching { windowManager?.removeViewImmediate(overlayView1) }
-            }
-            if (attached2 && overlayView2 != null) {
-                runCatching { windowManager?.removeViewImmediate(overlayView2) }
-            }
-            attached1 = false
-            attached2 = false
+            detachAllOverlaysSync()
             overlayView1 = null
             overlayParams1 = null
             overlayView2 = null

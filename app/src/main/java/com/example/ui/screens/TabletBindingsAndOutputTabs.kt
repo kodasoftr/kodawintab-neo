@@ -699,9 +699,9 @@ fun OutputTab(
                     verticalAlignment = Alignment.CenterVertically
                 ) {
                     Column(modifier = Modifier.weight(1f)) {
-                        Text("Compatibilização de DPI & Pressão (2.0)", style = MaterialTheme.typography.titleMedium)
+                        Text("Precisão Física de DPI & Pressão (2.1)", style = MaterialTheme.typography.titleMedium)
                         Text(
-                            text = "Normaliza velocidade X/Y em telas altas (20:9) preservando 100% dos níveis de pressão.",
+                            text = "DPI menor = mais área física p/ micro-precisão; DPI maior = traços ágeis compactos. Auto mantém peso idêntico em Retrato e Paisagem.",
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
@@ -718,10 +718,12 @@ fun OutputTab(
                     Text(
                         text = String.format(
                             Locale.US,
-                            "DPI Tela: %.0f×%.0f · Mesa: %d LPI · Pressão preservada: %d níveis",
+                            "DPI: %.0f×%.0f · %.1f px/mm · Área Física %.0f×%.0fmm · %d níveis",
                             telemetry.effectiveDpiX,
                             telemetry.effectiveDpiY,
-                            profile?.lpi ?: 5080,
+                            telemetry.pxPerMmX,
+                            telemetry.activeWidthMm,
+                            telemetry.activeHeightMm,
                             telemetry.maxNativePressure + 1
                         ),
                         style = MaterialTheme.typography.labelMedium,

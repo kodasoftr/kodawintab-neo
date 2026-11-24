@@ -1,5 +1,6 @@
 package com.example.service
 
+import android.app.AlarmManager
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
@@ -14,6 +15,7 @@ import android.os.Build
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
+import android.os.SystemClock
 import android.text.SpannableString
 import android.text.Spanned
 import android.text.style.ForegroundColorSpan
@@ -64,6 +66,8 @@ class KodaHubForegroundService : Service() {
         val app = application as KodaWintabApp
         runCatching { app.usbCoordinator.registerReceiver() }
         runCatching { app.pipelineMesa1.start() }
+        runCatching { app.cursorOverlayManager.setPaused(false) }
+        runCatching { app.cursorOverlayManager.refreshOverlayPermission() }
         runCatching { app.hubManager.startCoopMonitor(app.coopMonitorScope) }
         runCatching { app.startGlobalPointerStream() }
 
@@ -81,8 +85,47 @@ class KodaHubForegroundService : Service() {
                 performCompleteShutdown()
                 return START_NOT_STICKY
             }
+            else -> {
+                val app = application as? KodaWintabApp
+                if (app != null && !isPaused) {
+                    runCatching { app.usbCoordinator.registerReceiver() }
+                    runCatching { app.pipelineMesa1.start() }
+                    runCatching { app.cursorOverlayManager.setPaused(false) }
+                    runCatching { app.cursorOverlayManager.refreshOverlayPermission() }
+                    runCatching { app.startGlobalPointerStream() }
+                }
+            }
         }
         return START_STICKY
+    }
+
+    override fun onTaskRemoved(rootIntent: Intent?) {
+        // When user closes Koda Wintab from Recents to open Krita / ibisPaint / Clip Studio,
+        // keep USB Host sessions, cursor overlay, and tablet pipeline alive!
+        if (!wasUserTerminated(this)) {
+            val app = application as? KodaWintabApp
+            if (app != null && !isPaused) {
+                runCatching { app.usbCoordinator.registerReceiver() }
+                runCatching { app.pipelineMesa1.start() }
+                runCatching { app.cursorOverlayManager.refreshOverlayPermission() }
+            }
+            runCatching {
+                val restartIntent = Intent(applicationContext, KodaHubForegroundService::class.java)
+                val pi = PendingIntent.getForegroundService(
+                    applicationContext,
+                    2026,
+                    restartIntent,
+                    PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_ONE_SHOT
+                )
+                val am = getSystemService(ALARM_SERVICE) as? AlarmManager
+                am?.set(
+                    AlarmManager.ELAPSED_REALTIME_WAKEUP,
+                    SystemClock.elapsedRealtime() + 350L,
+                    pi
+                )
+            }
+        }
+        super.onTaskRemoved(rootIntent)
     }
 
     private fun togglePauseResume() {

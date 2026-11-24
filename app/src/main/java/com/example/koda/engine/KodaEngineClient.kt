@@ -127,10 +127,53 @@ class KodaEngineClient(private val context: Context) {
             serverPid = if (_state.value.isActive) _state.value.serverPid else pid,
             lastErrorName = null,
             lastErrorReason = null,
-            lastCheckMessage = "Koda Core Engine Ativa · Ativação Única sem PC concluída!"
+            lastCheckMessage = "Koda Core Engine Ativa · Ativação Autônoma sem PC concluída!"
         )
         _state.value = updated
         return updated
+    }
+
+    /**
+     * Autonomous standalone elevation engine:
+     * 1) Enables OTG + Accessibility global cursor + Overlay engine immediately without PC.
+     * 2) Probes if KodaShellServer is already running (e.g. from prior PC/Wireless ADB).
+     * 3) If device has local root binary (`su`), automatically spawns KodaShellServer daemon on-device
+     *    without needing a PC cable, falling back gracefully on unrooted devices.
+     */
+    suspend fun activateStandaloneWithAutoProbe(): KodaEngineState = withContext(Dispatchers.IO) {
+        val base = activateSingleEngine()
+        val verified = verifyConnection()
+        if (verified.isActive) {
+            runCatching { grantOverlayPermissionViaAdb() }
+            return@withContext verified
+        }
+        val suLaunched = tryLaunchLocalSuDaemon()
+        if (suLaunched) {
+            val rechecked = verifyConnection()
+            if (rechecked.isActive) {
+                runCatching { grantOverlayPermissionViaAdb() }
+                return@withContext rechecked.copy(
+                    coreEngineActive = true,
+                    lastCheckMessage = "Koda Core Engine + Daemon Shell Autônomo ativo sem PC (UID ${rechecked.serverUid})"
+                ).also { _state.value = it }
+            }
+        }
+        base
+    }
+
+    private fun tryLaunchLocalSuDaemon(): Boolean {
+        val suCandidates = listOf("/system/bin/su", "/system/xbin/su", "/sbin/su", "su")
+        val suBin = suCandidates.firstOrNull { path ->
+            path == "su" || java.io.File(path).exists()
+        } ?: return false
+        return runCatching {
+            val cmd = "CLASSPATH=$resolvedApkPath /system/bin/app_process /system/bin com.example.koda.engine.KodaShellServer --daemon --pkg=${context.packageName}"
+            val proc = ProcessBuilder(suBin, "-c", cmd)
+                .redirectErrorStream(true)
+                .start()
+            val finished = proc.waitFor(2500, java.util.concurrent.TimeUnit.MILLISECONDS)
+            finished && proc.exitValue() == 0
+        }.getOrDefault(false)
     }
 
     private fun buildInitialState(): KodaEngineState {

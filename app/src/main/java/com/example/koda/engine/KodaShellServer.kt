@@ -28,6 +28,7 @@ import java.io.InputStreamReader
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicLong
+import kotlin.math.PI
 import kotlin.math.atan2
 import kotlin.math.hypot
 
@@ -54,6 +55,7 @@ object KodaShellServer {
     private var moveRootTaskToDisplayMethod: Method? = null
     private var getTasksMethod: Method? = null
     private var systemContext: android.content.Context? = null
+    @Volatile private var preferredStylusInputDeviceId: Int = 0
     @Volatile private var forceHideNativePointer = false
     @Volatile private var lastHideEnforceMs = 0L
     @Volatile private var targetPenDisplayId = 0
@@ -545,6 +547,30 @@ object KodaShellServer {
                 .apply { isAccessible = true }
             registerNativeTaskStackListener(atm)
         }
+
+        preferredStylusInputDeviceId = resolveBestStylusOrTouchDeviceId()
+    }
+
+    private fun resolveBestStylusOrTouchDeviceId(): Int {
+        return runCatching {
+            val ids = InputDevice.getDeviceIds()
+            var fallbackTouchId = 0
+            for (id in ids) {
+                val dev = InputDevice.getDevice(id) ?: continue
+                if (dev.isVirtual) continue
+                val src = dev.sources
+                val hasPressure = dev.getMotionRange(MotionEvent.AXIS_PRESSURE) != null
+                if ((src and InputDevice.SOURCE_STYLUS) == InputDevice.SOURCE_STYLUS && hasPressure) {
+                    return@runCatching id
+                }
+                if (fallbackTouchId == 0 &&
+                    (src and InputDevice.SOURCE_TOUCHSCREEN) == InputDevice.SOURCE_TOUCHSCREEN
+                ) {
+                    fallbackTouchId = id
+                }
+            }
+            fallbackTouchId
+        }.getOrDefault(0)
     }
 
     @SuppressLint("PrivateApi")
@@ -633,7 +659,7 @@ object KodaShellServer {
                             output.flush()
                             continue
                         }
-                        val deviceId = input.readInt()
+                        val slotDeviceId = input.readInt()
                         val displayId = input.readInt()
                         val action = input.readInt()
                         val isEraser = input.readBoolean()
@@ -649,29 +675,54 @@ object KodaShellServer {
                             }
                         })
                         val coords = arrayOf(MotionEvent.PointerCoords())
-                        var downTime = stylusDownTimes[deviceId] ?: SystemClock.uptimeMillis()
+                        var downTime = stylusDownTimes[slotDeviceId] ?: SystemClock.uptimeMillis()
+                        val mappedDeviceId = if (preferredStylusInputDeviceId != 0) preferredStylusInputDeviceId else 0
+                        val degToRad = (PI / 180.0).toFloat()
+                        val maxTiltRad = (PI / 2.0).toFloat()
 
                         for (i in 0 until count) {
                             val eventTime = input.readLong()
                             val x = input.readFloat()
                             val y = input.readFloat()
-                            val pressure = input.readFloat()
-                            val tiltX = input.readFloat()
-                            val tiltY = input.readFloat()
+                            val rawPressure = input.readFloat().coerceIn(0f, 1f)
+                            val tiltXDeg = input.readFloat()
+                            val tiltYDeg = input.readFloat()
                             val buttonState = input.readInt()
+
+                            val isTouchAction = action == MotionEvent.ACTION_DOWN || action == MotionEvent.ACTION_MOVE
+                            val effectivePressure = when {
+                                action == MotionEvent.ACTION_DOWN -> rawPressure.coerceAtLeast(0.02f)
+                                isTouchAction -> rawPressure.coerceAtLeast(0.005f)
+                                else -> 0f
+                            }
+                            val contactSpan = if (effectivePressure > 0f) 4f + effectivePressure * 24f else 0f
+                            val tiltRad = (hypot(tiltXDeg, tiltYDeg) * degToRad).coerceIn(0f, maxTiltRad)
+                            val orientationRad = if (tiltRad > 0.002f) {
+                                // Android AXIS_ORIENTATION: radians clockwise from -Y (screen up)
+                                atan2(tiltXDeg, -tiltYDeg)
+                            } else 0f
 
                             val pc = coords[0]
                             pc.x = x
                             pc.y = y
-                            pc.pressure = pressure
-                            pc.size = 0.05f
-                            pc.setAxisValue(MotionEvent.AXIS_TILT, hypot(tiltX, tiltY))
-                            pc.setAxisValue(MotionEvent.AXIS_ORIENTATION, atan2(tiltY, tiltX))
+                            pc.pressure = effectivePressure
+                            pc.size = if (effectivePressure > 0f) (0.04f + effectivePressure * 0.96f) else 0f
+                            pc.touchMajor = contactSpan
+                            pc.touchMinor = contactSpan
+                            pc.toolMajor = contactSpan
+                            pc.toolMinor = contactSpan
+                            pc.orientation = orientationRad
+                            pc.setAxisValue(MotionEvent.AXIS_TILT, tiltRad)
+                            pc.setAxisValue(MotionEvent.AXIS_ORIENTATION, orientationRad)
+                            pc.setAxisValue(
+                                MotionEvent.AXIS_DISTANCE,
+                                if (isTouchAction || action == MotionEvent.ACTION_UP) 0f else 1f
+                            )
 
                             if (i == 0) {
                                 if (action == MotionEvent.ACTION_DOWN) {
                                     downTime = eventTime
-                                    stylusDownTimes[deviceId] = downTime
+                                    stylusDownTimes[slotDeviceId] = downTime
                                 }
                                 event = MotionEvent.obtain(
                                     downTime,
@@ -684,14 +735,18 @@ object KodaShellServer {
                                     buttonState,
                                     1f,
                                     1f,
-                                    deviceId,
+                                    mappedDeviceId,
                                     0,
-                                    InputDevice.SOURCE_STYLUS,
+                                    InputDevice.SOURCE_STYLUS or InputDevice.SOURCE_TOUCHSCREEN,
                                     0
                                 )
                             } else {
                                 event?.addBatch(eventTime, coords, 0)
                             }
+                        }
+
+                        if (action == MotionEvent.ACTION_UP || action == MotionEvent.ACTION_CANCEL) {
+                            stylusDownTimes.remove(slotDeviceId)
                         }
 
                         val ok = if (event != null) {
@@ -731,6 +786,9 @@ object KodaShellServer {
                         } else {
                             mouseDownTimes[deviceId] ?: now
                         }
+                        if (action == MotionEvent.ACTION_UP || action == MotionEvent.ACTION_CANCEL) {
+                            mouseDownTimes.remove(deviceId)
+                        }
 
                         val props = arrayOf(MotionEvent.PointerProperties().apply {
                             id = 0
@@ -746,13 +804,6 @@ object KodaShellServer {
                             0, buttonState, 1f, 1f, deviceId, 0,
                             InputDevice.SOURCE_MOUSE, 0
                         )
-                        if (forceHideNativePointer) {
-                            val nowMs = SystemClock.uptimeMillis()
-                            if (nowMs - lastHideEnforceMs >= 120L) {
-                                lastHideEnforceMs = nowMs
-                                enforceHiddenNativePointer()
-                            }
-                        }
                         if (displayId > 0) {
                             runCatching { motionSetDisplayIdMethod?.invoke(event, displayId) }
                         }
@@ -1020,6 +1071,7 @@ object KodaShellServer {
             runCatching { PointerIcon.getSystemIcon(ctx, PointerIcon.TYPE_NULL) }.getOrNull()
         }
         val transparent = Bitmap.createBitmap(1, 1, Bitmap.Config.ARGB_8888)
+        transparent.eraseColor(0x00000000)
         return applyPointerIconAcrossApis(transparent, 0f, 0f, typeOverride = PointerIcon.TYPE_NULL, prebuiltIcon = sysIcon)
     }
 
@@ -1031,7 +1083,8 @@ object KodaShellServer {
         prebuiltIcon: PointerIcon? = null
     ): Boolean {
         val im = inputManagerInstance ?: return false
-        val icon = prebuiltIcon ?: PointerIcon.create(bmp, hx, hy)
+        val bitmapIcon = PointerIcon.create(bmp, hx, hy)
+        val icon = prebuiltIcon ?: bitmapIcon
         var applied = false
 
         if (typeOverride != null) {
@@ -1043,7 +1096,7 @@ object KodaShellServer {
         }
         runCatching {
             val mCustom = im.javaClass.getMethod("setCustomPointerIcon", PointerIcon::class.java)
-            mCustom.invoke(im, icon)
+            mCustom.invoke(im, bitmapIcon)
             applied = true
         }
         val targetDeviceIds = buildList {

@@ -1,13 +1,16 @@
 package com.example.driver
 
+import kotlin.math.min
+
 /**
  * Pre-calculated 2x3 affine transformation matrix for sub-pixel coordinate mapping.
  *
- * v2.0 adds DPI-compatible isotropic screen-to-tablet scaling (`dpiMode`: AUTO / MANUAL X-Y) so tall
- * smartphone screens (e.g. 20:9 where Y pixels >> X pixels) have identical horizontal and vertical
- * physical stroke response without clipping or reducing native tablet pressure levels.
- *
- * Hot-path transform performs only 4 multiplications, 2 additions, and 0 heap allocations.
+ * v2.1:
+ * - True physical DPI mapping (`DpiNormalizationMode.MANUAL`) where changing DPI (160..1200)
+ *   genuinely scales the tablet's physical active mm-to-pixel precision ratio.
+ * - Constant-density Landscape/Portrait scaling (`DpiNormalizationMode.AUTO`) so laying the phone
+ *   sideways never slows down or makes the tablet feel heavy (identical px/mm in both orientations).
+ * - Preserves 1:1 circular aspect symmetry & zero-allocation hot path (4 muls + 2 adds).
  */
 class CoordinateMatrix {
 
@@ -30,6 +33,14 @@ class CoordinateMatrix {
     @Volatile var effectiveDpiX: Float = 420f
         private set
     @Volatile var effectiveDpiY: Float = 420f
+        private set
+    @Volatile var effectivePxPerMmX: Float = 16.5f
+        private set
+    @Volatile var effectivePxPerMmY: Float = 16.5f
+        private set
+    @Volatile var activeWidthMm: Float = 160f
+        private set
+    @Volatile var activeHeightMm: Float = 100f
         private set
 
     fun rebuild(
@@ -69,64 +80,139 @@ class CoordinateMatrix {
         effectiveDpiY = safeDpiY
 
         // Effective rotation:
-        // - Vertical (displayRotationDeg == 0): autoDelta = 0 (unchanged).
-        // - Horizontal when autoRotation && rotateAxesWithScreen: Android Surface.ROTATION_90 is 90 CCW,
-        //   so compensating tablet axes uses (360 - displayRotationDeg) % 360 (matching CursorOverlayManager).
-        // - When !autoRotation || !rotateAxesWithScreen: keeps tablet desk-aligned (manualRotationDeg)
-        //   regardless of phone orientation, while adapting to rotated display width/height & DPI.
+        // - Horizontal when autoRotation && rotateAxesWithScreen: compensates Android CCW screen rotation.
+        // - When rotateAxesWithScreen == false (default: tablet sits horizontally on desk):
+        //   tablet keeps manualRotationDeg (0°) so left/right on tablet ALWAYS stays left/right on phone
+        //   without flipping upside down when laying phone sideways.
         val autoDelta = if (autoRotation && rotateAxesWithScreen) ((360 - displayRotationDeg) % 360) else 0
         val totalRot = (((manualRotationDeg + autoDelta) % 360) + 360) % 360
         effectiveRotationDeg = totalRot
 
-        // Compute screen bounds
+        // Compute target screen bounds
         val sw = (screenArea.widthNorm.coerceIn(0.05f, 1f)) * displayWidthPx
         val sh = (screenArea.heightNorm.coerceIn(0.05f, 1f)) * displayHeightPx
         val screenX = (screenArea.leftNorm.coerceIn(0f, 0.95f)) * displayWidthPx
         val screenY = (screenArea.topNorm.coerceIn(0f, 0.95f)) * displayHeightPx
 
-        // When DPI normalization or aspect lock is active, normalize physical tablet X/Y ratio
-        // against the physical screen aspect (in inches/mm via DPI X & DPI Y) so Y strokes are
-        // never heavier/faster than X strokes on tall mobile screens.
-        if (dpiMode != DpiNormalizationMode.OFF || lockAspectRatio) {
-            val screenPhysW = sw / safeDpiX
-            val screenPhysH = sh / safeDpiY
-            val screenAspect = (screenPhysW / screenPhysH.coerceAtLeast(0.01f)).coerceIn(0.2f, 5f)
+        val fullTabW = tabletWidthMm.coerceAtLeast(10f)
+        val fullTabH = tabletHeightMm.coerceAtLeast(10f)
+        val availTabW = fullTabW * aw
+        val availTabH = fullTabH * ah
+        val rotatedIsSideways = totalRot == 90 || totalRot == 270
+        val effTabW = if (rotatedIsSideways) availTabH else availTabW
+        val effTabH = if (rotatedIsSideways) availTabW else availTabH
 
-            val rawTabW = tabletWidthMm.coerceAtLeast(10f) * aw
-            val rawTabH = tabletHeightMm.coerceAtLeast(10f) * ah
-            val rotatedIsSideways = totalRot == 90 || totalRot == 270
-            val effTabW = if (rotatedIsSideways) rawTabH else rawTabW
-            val effTabH = if (rotatedIsSideways) rawTabW else rawTabH
-            val tabletAspect = (effTabW / effTabH.coerceAtLeast(1f)).coerceIn(0.2f, 5f)
-
-            if (dpiMode != DpiNormalizationMode.OFF && kotlin.math.abs(tabletAspect - screenAspect) > 0.04f) {
-                if (tabletAspect > screenAspect) {
-                    // Tablet is wider than screen: trim tablet width symmetrically so X/Y DPI density matches
-                    val targetRatio = screenAspect / tabletAspect
-                    val newAw = (aw * targetRatio).coerceIn(0.15f, 1f)
-                    if (!rotatedIsSideways) {
-                        ax += (aw - newAw) * 0.5f
-                        aw = newAw
-                    } else {
-                        val newAh = (ah * targetRatio).coerceIn(0.15f, 1f)
-                        ay += (ah - newAh) * 0.5f
-                        ah = newAh
+        when {
+            dpiMode == DpiNormalizationMode.AUTO -> {
+                // Constant physical density (px/mm) across BOTH Portrait & Landscape orientations:
+                // Anchors stroke speed to the tightest screen-to-tablet ratio so laying the phone
+                // sideways never stretches active area across full width and never feels heavy.
+                val maxScreenPx = maxOf(sw, sh)
+                val minScreenPx = minOf(sw, sh)
+                val maxTabMm = maxOf(effTabW, effTabH)
+                val minTabMm = minOf(effTabW, effTabH)
+                val baselinePxPerMm = min(maxScreenPx / minTabMm, minScreenPx / minTabMm.coerceAtLeast(1f))
+                    .let {
+                        // Prefer crisp isotropic fit: fit longest screen axis onto min tablet side when possible
+                        val portraitDensity = maxScreenPx / minTabMm
+                        val landscapeDensity = maxScreenPx / maxTabMm
+                        // If portrait density fits both orientations nicely inside physical tablet bounds, use it!
+                        if (minScreenPx / portraitDensity <= minTabMm && maxScreenPx / portraitDensity <= maxTabMm) {
+                            portraitDensity
+                        } else {
+                            // Fit within physical tablet while preserving 1:1 ratio and boosting small side
+                            maxOf(portraitDensity.coerceAtMost(maxScreenPx / minTabMm), landscapeDensity)
+                        }
                     }
+
+                var targetW = sw / baselinePxPerMm
+                var targetH = sh / baselinePxPerMm
+                val fitScale = minOf(effTabW / targetW, effTabH / targetH, 1f)
+                targetW *= fitScale
+                targetH *= fitScale
+
+                val newAw = if (!rotatedIsSideways) (targetW / fullTabW).coerceIn(0.12f, aw) else (targetH / fullTabW).coerceIn(0.12f, aw)
+                val newAh = if (!rotatedIsSideways) (targetH / fullTabH).coerceIn(0.12f, ah) else (targetW / fullTabH).coerceIn(0.12f, ah)
+                ax += (aw - newAw) * 0.5f
+                ay += (ah - newAh) * 0.5f
+                aw = newAw
+                ah = newAh
+            }
+
+            dpiMode == DpiNormalizationMode.MANUAL -> {
+                // Ergonomic physical DPI scale anchored cleanly inside the tablet's 1:1 fitting box
+                // (240 DPI -> full ergonomic span, 440 DPI -> ~55% balanced, 640+ DPI -> compact agile)
+                // while preserving constant density across Portrait & Landscape and independent X/Y tuning.
+                val maxScreenPx = maxOf(sw, sh)
+                val minScreenPx = minOf(sw, sh)
+                val maxTabMm = maxOf(effTabW, effTabH)
+                val minTabMm = minOf(effTabW, effTabH)
+                val portraitDensity = maxScreenPx / minTabMm
+                val baseDensity = if (minScreenPx / portraitDensity <= minTabMm && maxScreenPx / portraitDensity <= maxTabMm) {
+                    portraitDensity
                 } else {
-                    // Screen is wider than tablet: trim tablet height symmetrically
-                    val targetRatio = tabletAspect / screenAspect
-                    if (!rotatedIsSideways) {
-                        val newAh = (ah * targetRatio).coerceIn(0.15f, 1f)
-                        ay += (ah - newAh) * 0.5f
-                        ah = newAh
+                    maxOf(portraitDensity.coerceAtMost(maxScreenPx / minTabMm), maxScreenPx / maxTabMm)
+                }
+                val baseBoxW = sw / baseDensity
+                val baseBoxH = sh / baseDensity
+
+                val dpiScaleX = (240f / safeDpiX).coerceIn(0.16f, 1.0f)
+                val dpiScaleY = (240f / safeDpiY).coerceIn(0.16f, 1.0f)
+                var desiredW = baseBoxW * dpiScaleX
+                var desiredH = baseBoxH * dpiScaleY
+
+                val fitScale = minOf(effTabW / desiredW, effTabH / desiredH, 1f)
+                desiredW *= fitScale
+                desiredH *= fitScale
+
+                val newAw = if (!rotatedIsSideways) (desiredW / fullTabW).coerceIn(0.08f, aw) else (desiredH / fullTabW).coerceIn(0.08f, aw)
+                val newAh = if (!rotatedIsSideways) (desiredH / fullTabH).coerceIn(0.08f, ah) else (desiredW / fullTabH).coerceIn(0.08f, ah)
+                ax += (aw - newAw) * 0.5f
+                ay += (ah - newAh) * 0.5f
+                aw = newAw
+                ah = newAh
+            }
+
+            lockAspectRatio -> {
+                // Simple 1:1 aspect ratio crop inside activeArea without DPI overrides
+                val screenAspect = (sw / sh.coerceAtLeast(1f)).coerceIn(0.2f, 5f)
+                val tabletAspect = (effTabW / effTabH.coerceAtLeast(1f)).coerceIn(0.2f, 5f)
+                if (kotlin.math.abs(tabletAspect - screenAspect) > 0.04f) {
+                    if (tabletAspect > screenAspect) {
+                        val targetRatio = screenAspect / tabletAspect
+                        if (!rotatedIsSideways) {
+                            val newAw = (aw * targetRatio).coerceIn(0.12f, aw)
+                            ax += (aw - newAw) * 0.5f
+                            aw = newAw
+                        } else {
+                            val newAh = (ah * targetRatio).coerceIn(0.12f, ah)
+                            ay += (ah - newAh) * 0.5f
+                            ah = newAh
+                        }
                     } else {
-                        val newAw = (aw * targetRatio).coerceIn(0.15f, 1f)
-                        ax += (aw - newAw) * 0.5f
-                        aw = newAw
+                        val targetRatio = tabletAspect / screenAspect
+                        if (!rotatedIsSideways) {
+                            val newAh = (ah * targetRatio).coerceIn(0.12f, ah)
+                            ay += (ah - newAh) * 0.5f
+                            ah = newAh
+                        } else {
+                            val newAw = (aw * targetRatio).coerceIn(0.12f, aw)
+                            ax += (aw - newAw) * 0.5f
+                            aw = newAw
+                        }
                     }
                 }
             }
         }
+
+        val finalMmW = fullTabW * aw
+        val finalMmH = fullTabH * ah
+        val mappedMmX = if (rotatedIsSideways) finalMmH else finalMmW
+        val mappedMmY = if (rotatedIsSideways) finalMmW else finalMmH
+        activeWidthMm = mappedMmX
+        activeHeightMm = mappedMmY
+        effectivePxPerMmX = sw / mappedMmX.coerceAtLeast(1f)
+        effectivePxPerMmY = sh / mappedMmY.coerceAtLeast(1f)
 
         // Normalized -> active-area local [0..1]: u = (nx - ax) / aw, v = (ny - ay) / ah
         val scaleU = 1f / aw
@@ -197,6 +283,16 @@ class CoordinateMatrix {
     fun transform(rawX: Float, rawY: Float, outXY: FloatArray) {
         val nx = rawX * invMaxX
         val ny = rawY * invMaxY
+        val px = m00 * nx + m01 * ny + m02
+        val py = m10 * nx + m11 * ny + m12
+        outXY[0] = px.coerceIn(outMinX, outMaxX)
+        outXY[1] = py.coerceIn(outMinY, outMaxY)
+    }
+
+    /**
+     * Sub-pixel transform from normalized [0..1] tablet coordinates (e.g. getevent global stream).
+     */
+    fun transformNormalized(nx: Float, ny: Float, outXY: FloatArray) {
         val px = m00 * nx + m01 * ny + m02
         val py = m10 * nx + m11 * ny + m12
         outXY[0] = px.coerceIn(outMinX, outMaxX)

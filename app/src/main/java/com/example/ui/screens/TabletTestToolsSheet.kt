@@ -41,16 +41,18 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.unit.dp
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.example.driver.DriverTelemetry
 import com.example.driver.HidHexFrame
 import com.example.ui.theme.EmeraldActive
+import kotlinx.coroutines.flow.StateFlow
 import java.util.Locale
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun TabletTestToolsSheet(
-    telemetry: DriverTelemetry,
-    hexFrames: List<HidHexFrame>,
+    telemetryFlow: StateFlow<DriverTelemetry>,
+    hexFramesFlow: StateFlow<List<HidHexFrame>>,
     onFeedTestPacket: (normX: Float, normY: Float, pressure: Float, isDown: Boolean) -> Unit,
     @Suppress("UNUSED_PARAMETER") onOpenFullScreenBlankSheet: () -> Unit = {},
     @Suppress("UNUSED_PARAMETER") onOpenFullScreenCalibration: () -> Unit = {},
@@ -105,9 +107,18 @@ fun TabletTestToolsSheet(
             }
 
             when (selectedToolTab) {
-                0 -> HexDumpMonitorTool(hexFrames = hexFrames, onFeedTestPacket = onFeedTestPacket)
-                1 -> LatencyMeterTool(telemetry = telemetry, onFeedTestPacket = onFeedTestPacket)
-                2 -> LiveTelemetryTab(telemetry = telemetry, onFeedTestPacket = onFeedTestPacket)
+                0 -> {
+                    val hexFrames by hexFramesFlow.collectAsStateWithLifecycle()
+                    HexDumpMonitorTool(hexFrames = hexFrames, onFeedTestPacket = onFeedTestPacket)
+                }
+                1 -> {
+                    val telemetry by telemetryFlow.collectAsStateWithLifecycle()
+                    LatencyMeterTool(telemetry = telemetry, onFeedTestPacket = onFeedTestPacket)
+                }
+                2 -> {
+                    val telemetry by telemetryFlow.collectAsStateWithLifecycle()
+                    LiveTelemetryTab(telemetry = telemetry, onFeedTestPacket = onFeedTestPacket)
+                }
             }
         }
     }

@@ -3,7 +3,10 @@ package com.example.hub
 import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
+import android.graphics.Canvas
 import android.graphics.Color
+import android.graphics.Paint
+import android.graphics.Path
 import android.net.Uri
 import android.view.PointerIcon
 import java.nio.ByteBuffer
@@ -33,9 +36,61 @@ data class DecodedCursor(
 
 /**
  * Decodes .png, Windows .cur (32/24/8/4/1bpp + PNG frames with exact hotspot), and animated
- * .ani (RIFF ACON multi-frame cursors with anih rate) selected via SAF without storage permissions.
+ * .ani (RIFF ACON multi-frame cursors with anih rate) selected via SAF without storage permissions,
+ * and builds a crisp high-contrast default Koda arrow cursor so overlays work immediately out of the box.
  */
 object CursorDecoder {
+
+    fun createDefaultKodaCursor(): DecodedCursor {
+        val size = 56
+        val bmp = Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888)
+        val canvas = Canvas(bmp)
+
+        val arrowPath = Path().apply {
+            moveTo(4f, 4f)
+            lineTo(4f, 44f)
+            lineTo(15f, 33f)
+            lineTo(23f, 50f)
+            lineTo(30f, 46f)
+            lineTo(22f, 29f)
+            lineTo(38f, 29f)
+            close()
+        }
+
+        val outlinePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            style = Paint.Style.STROKE
+            strokeWidth = 5f
+            strokeJoin = Paint.Join.ROUND
+            color = Color.parseColor("#0B0F1A")
+        }
+        val glowPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            style = Paint.Style.STROKE
+            strokeWidth = 2.5f
+            strokeJoin = Paint.Join.ROUND
+            color = Color.parseColor("#00E5FF")
+        }
+        val fillPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            style = Paint.Style.FILL
+            color = Color.WHITE
+        }
+
+        canvas.drawPath(arrowPath, outlinePaint)
+        canvas.drawPath(arrowPath, glowPaint)
+        canvas.drawPath(arrowPath, fillPaint)
+
+        val hx = 4f
+        val hy = 4f
+        return DecodedCursor(
+            fileName = "Padrão Koda (Seta)",
+            bitmap = bmp,
+            hotspotX = hx,
+            hotspotY = hy,
+            pointerIcon = runCatching { PointerIcon.create(bmp, hx, hy) }.getOrNull(),
+            sourceFormat = "KODA",
+            frames = listOf(bmp),
+            frameDurationMs = 80L
+        )
+    }
 
     fun decodeFromUri(context: Context, uri: Uri, displayName: String): DecodedCursor? {
         val bytes = context.contentResolver.openInputStream(uri)?.use { it.readBytes() } ?: return null

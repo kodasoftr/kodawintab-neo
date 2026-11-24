@@ -75,6 +75,7 @@ class PenDisplayEngineManager(
 
     private var virtualDisplay: VirtualDisplay? = null
     private var presentation: KodasoftrDesktopPresentation? = null
+    @Volatile private var prevPenDisplayTipDown = false
 
     init {
         scope.launch {
@@ -233,6 +234,7 @@ class PenDisplayEngineManager(
     }
 
     fun stopPenDisplaySession() {
+        prevPenDisplayTipDown = false
         runCatching { presentation?.dismiss() }
         presentation = null
         runCatching { virtualDisplay?.release() }
@@ -268,12 +270,23 @@ class PenDisplayEngineManager(
         normX: Float,
         normY: Float,
         pressureNorm: Float,
-        isTipDown: Boolean
+        isTipDown: Boolean,
+        tiltX: Float = 0f,
+        tiltY: Float = 0f,
+        injectSystemEvent: Boolean = true
     ) {
         val nx = normX.coerceIn(0f, 1f)
         val ny = normY.coerceIn(0f, 1f)
         val p = if (isTipDown) pressureNorm.coerceIn(0f, 1f) else 0f
         val st = _state.value
+        val wasDown = prevPenDisplayTipDown
+        prevPenDisplayTipDown = isTipDown
+        val action = when {
+            isTipDown && !wasDown -> MotionEvent.ACTION_DOWN
+            isTipDown && wasDown -> MotionEvent.ACTION_MOVE
+            !isTipDown && wasDown -> MotionEvent.ACTION_UP
+            else -> MotionEvent.ACTION_HOVER_MOVE
+        }
         _state.value = st.copy(
             lastStylusNormX = nx,
             lastStylusNormY = ny,
@@ -282,10 +295,9 @@ class PenDisplayEngineManager(
         )
         presentation?.updateStylusCursor(nx, ny, p, isTipDown)
 
-        if (st.virtualDisplayId > 0 && engineClient.state.value.isActive) {
+        if (injectSystemEvent && st.virtualDisplayId > 0 && engineClient.state.value.isActive) {
             val sx = nx * st.selectedPreset.widthPx
             val sy = ny * st.selectedPreset.heightPx
-            val action = if (isTipDown) MotionEvent.ACTION_MOVE else MotionEvent.ACTION_HOVER_MOVE
             engineClient.sendStylusBatch(
                 deviceId = 105,
                 displayId = st.virtualDisplayId,
@@ -297,8 +309,8 @@ class PenDisplayEngineManager(
                         x = sx,
                         y = sy,
                         pressure = p,
-                        tiltX = 0f,
-                        tiltY = 0f,
+                        tiltX = tiltX,
+                        tiltY = tiltY,
                         buttonState = 0
                     )
                 )

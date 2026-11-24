@@ -32,6 +32,8 @@ import com.example.pendisplay.PenDisplayTaskEntry
 import com.example.service.KodaHubForegroundService
 import com.example.usb.ConnectedUsbDeviceInfo
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -85,6 +87,11 @@ class KodaViewModel(application: Application) : AndroidViewModel(application) {
     private val _errorPopup = MutableStateFlow<AppErrorReport?>(null)
     val errorPopup: StateFlow<AppErrorReport?> = _errorPopup.asStateFlow()
 
+    private val _batteryUnrestricted = MutableStateFlow(checkBatteryIgnoringOptimizations())
+    val batteryUnrestricted: StateFlow<Boolean> = _batteryUnrestricted.asStateFlow()
+
+    private var saveConfigJob: Job? = null
+
     init {
         engineClient.syncPermanentActivationFromPrefs()
         _availableProfiles.value = runCatching { profileRepo.getAllProfiles() }.getOrDefault(emptyList())
@@ -108,11 +115,9 @@ class KodaViewModel(application: Application) : AndroidViewModel(application) {
                 runCatching { hubManager.loadLaunchableApps() }
             }
             runCatching { usbCoordinator.registerReceiver() }
-            runCatching { hubManager.startCoopMonitor(viewModelScope) }
+            runCatching { hubManager.startCoopMonitor(app.coopMonitorScope) }
             if (engineClient.isPermanentlyActivated()) {
-                cursorOverlayManager.setPaused(false)
-                startHubServiceSafely()
-                runCatching { usbCoordinator.refreshConnectedDevices() }
+                app.ensureBackgroundDriverActive()
             }
             val connState = engineClient.verifyConnection()
             if (connState.isActive) {
@@ -120,10 +125,15 @@ class KodaViewModel(application: Application) : AndroidViewModel(application) {
                 startHubServiceSafely()
             }
             cursorOverlayManager.refreshOverlayPermission()
+            refreshBatteryOptimizationState()
         }
     }
 
     fun isPermanentlyActivated(): Boolean = engineClient.isPermanentlyActivated()
+
+    fun setCalibrationCursorSuppressed(suppressed: Boolean) {
+        cursorOverlayManager.setCalibrationSuppressed(suppressed)
+    }
 
     fun onNewUsbIntent(intent: android.content.Intent?) {
         usbCoordinator.onNewUsbIntent(intent)
@@ -204,13 +214,61 @@ class KodaViewModel(application: Application) : AndroidViewModel(application) {
 
     fun activateSingleEngine() {
         engineClient.activateSingleEngine()
-        cursorOverlayManager.setPaused(false)
-        cursorOverlayManager.refreshOverlayPermission()
+        app.ensureBackgroundDriverActive()
         startHubServiceSafely()
-        runCatching { usbCoordinator.registerReceiver() }
-        runCatching { usbCoordinator.refreshConnectedDevices() }
         displayManager.refreshDisplays()
+        refreshBatteryOptimizationState()
         _statusToast.value = "Koda Core Engine ativada em 1 toque (sem PC / sem Modo Desenvolvedor)!"
+        viewModelScope.launch {
+            val probed = engineClient.activateStandaloneWithAutoProbe()
+            if (probed.isActive) {
+                cursorOverlayManager.refreshOverlayPermission()
+                _statusToast.value = "Motor Autônomo + Daemon Shell ativos (UID ${probed.serverUid})!"
+            }
+        }
+    }
+
+    private fun checkBatteryIgnoringOptimizations(): Boolean {
+        val pm = app.getSystemService(Context.POWER_SERVICE) as? android.os.PowerManager ?: return false
+        return runCatching { pm.isIgnoringBatteryOptimizations(app.packageName) }.getOrDefault(false)
+    }
+
+    fun refreshBatteryOptimizationState() {
+        _batteryUnrestricted.value = checkBatteryIgnoringOptimizations()
+    }
+
+    fun openBatteryOptimizationSettings() {
+        runCatching {
+            val intent = android.content.Intent(
+                android.provider.Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
+                android.net.Uri.parse("package:${app.packageName}")
+            ).addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
+            app.startActivity(intent)
+        }.onFailure {
+            runCatching {
+                val fallback = android.content.Intent(android.provider.Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS)
+                    .addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
+                app.startActivity(fallback)
+            }
+        }
+    }
+
+    fun openAccessibilitySettings() {
+        runCatching {
+            val intent = android.content.Intent(android.provider.Settings.ACTION_ACCESSIBILITY_SETTINGS)
+                .addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
+            app.startActivity(intent)
+        }
+    }
+
+    fun openOverlaySettings() {
+        runCatching {
+            val intent = android.content.Intent(
+                android.provider.Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                android.net.Uri.parse("package:${app.packageName}")
+            ).addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
+            app.startActivity(intent)
+        }
     }
 
     fun togglePenDisplayConnected(enabled: Boolean) {
@@ -276,7 +334,9 @@ class KodaViewModel(application: Application) : AndroidViewModel(application) {
         val updated = transform(_tabletConfig.value)
         _tabletConfig.value = updated
         applyPipelineConfig(updated, displayRotationDeg.value)
-        viewModelScope.launch {
+        saveConfigJob?.cancel()
+        saveConfigJob = viewModelScope.launch(Dispatchers.IO) {
+            delay(180L)
             profileRepo.saveConfig(updated)
         }
     }
@@ -634,29 +694,24 @@ class KodaViewModel(application: Application) : AndroidViewModel(application) {
         val parser = profileRepo.createParserFor(profile)
         val disp = displayManager.getDisplayOrDefault(cfg.targetDisplayId)
         val effectiveRot = if (disp.rotationDeg != 0 || rotDeg == 0) disp.rotationDeg else rotDeg
+        val effectiveDisp = disp.copy(rotationDeg = effectiveRot)
         usbCoordinator.updateMouseDisplayBounds(
-            widthPx = disp.widthPx.toFloat(),
-            heightPx = disp.heightPx.toFloat()
+            widthPx = effectiveDisp.widthPx.toFloat(),
+            heightPx = effectiveDisp.heightPx.toFloat()
         )
-        cursorOverlayManager.setTabletRotationConfig(
-            autoRotateWithScreen = cfg.autoRotation && cfg.rotateTabletAxesWithScreen,
-            manualRotationDeg = cfg.manualRotationDeg
-        )
-        cursorOverlayManager.updateDisplayBounds(
-            widthPx = disp.widthPx.toFloat(),
-            heightPx = disp.heightPx.toFloat(),
-            rotationDeg = effectiveRot
-        )
+        if (cfg.slotId != TabletSlotId.MESA_2) {
+            cursorOverlayManager.syncTabletMatrixConfig(cfg, profile, effectiveDisp)
+        }
         val pipeline = if (cfg.slotId == TabletSlotId.MESA_2) pipeline2 else pipeline1
         pipeline.updateConfiguration(
             newConfig = cfg,
             profile = profile,
             parser = parser,
-            displayWidth = disp.widthPx.toFloat(),
-            displayHeight = disp.heightPx.toFloat(),
+            displayWidth = effectiveDisp.widthPx.toFloat(),
+            displayHeight = effectiveDisp.heightPx.toFloat(),
             displayRotationDeg = effectiveRot,
-            displayXdpi = disp.xdpi,
-            displayYdpi = disp.ydpi
+            displayXdpi = effectiveDisp.xdpi,
+            displayYdpi = effectiveDisp.ydpi
         )
     }
 

@@ -33,27 +33,30 @@ class UgeeS640Parser(
     override val brand: TabletBrand = TabletBrand.UGEE
 
     override fun parse(packet: ByteArray, length: Int, out: TabletReport): Boolean {
-        if (length < 8) return false
+        if (length < 6) return false
         val reportId = packet[0].toInt() and 0xFF
-        if (reportId != 0x02 && reportId != 0x07 && reportId != 0x01) return false
+        if (reportId != 0x02 && reportId != 0x07 && reportId != 0x01 && reportId != 0x06) return false
 
         val status = packet[1].toInt() and 0xFF
 
-        // Express key report frame (0xF0)
-        if (status == 0xF0 && length >= 5) {
+        // Express key report frame (0xF0 or 0x06/0xF1 keypad)
+        if ((status == 0xF0 || status == 0xF1) && length >= 5) {
             out.reset()
             out.valid = true
             out.maxX = maxX
             out.maxY = maxY
             out.maxPressure = maxPressure
             out.expressKeyMask = (packet[2].toInt() and 0xFF) or ((packet[3].toInt() and 0xFF) shl 8)
+            out.isExpressKeyFrame = true
             return true
         }
 
         // Pen out of proximity is 0xC0 or 0x00 with zero coords; inside magnetic field keeps coords active
         val rawX = (packet[2].toInt() and 0xFF) or ((packet[3].toInt() and 0xFF) shl 8)
         val rawY = (packet[4].toInt() and 0xFF) or ((packet[5].toInt() and 0xFF) shl 8)
-        val rawP = (packet[6].toInt() and 0xFF) or ((packet[7].toInt() and 0xFF) shl 8)
+        val rawP = if (length >= 8) {
+            (packet[6].toInt() and 0xFF) or ((packet[7].toInt() and 0xFF) shl 8)
+        } else 0
         val explicitlyOutOfRange = status == 0xC0 || (status == 0x00 && rawX == 0 && rawY == 0 && rawP == 0)
         val inRange = !explicitlyOutOfRange && (
             ((status and 0x80) != 0 && (status and 0x40) == 0) ||
@@ -74,6 +77,7 @@ class UgeeS640Parser(
         out.barrelButton2 = inRange && (status and 0x04) != 0
         out.isEraser = inRange && (status and 0x20) != 0
         out.expressKeyMask = 0
+        out.isExpressKeyFrame = false
 
         if (length >= 10) {
             out.tiltXDeg = packet[8].toInt().toFloat().coerceIn(-60f, 60f)
@@ -111,6 +115,7 @@ class WacomParser(
             out.maxY = maxY
             out.maxPressure = maxPressure
             out.expressKeyMask = packet[2].toInt() and 0xFF
+            out.isExpressKeyFrame = true
             return true
         }
 
@@ -149,12 +154,13 @@ class WacomParser(
         out.tiltXDeg = 0f
         out.tiltYDeg = 0f
         out.expressKeyMask = 0
+        out.isExpressKeyFrame = false
         return true
     }
 }
 
 /**
- * Parser for Huion / UC-Logic tablets (VID 0x256C).
+ * Parser for Huion / UC-Logic / Gaomon / Veikk tablets (VID 0x256C / 0x2FEB / 0x5543).
  */
 class HuionParser(
     private val maxX: Int = 32000,
@@ -167,7 +173,7 @@ class HuionParser(
     override fun parse(packet: ByteArray, length: Int, out: TabletReport): Boolean {
         if (length < 8) return false
         val reportId = packet[0].toInt() and 0xFF
-        if (reportId != 0x08 && reportId != 0x07 && reportId != 0x0A) return false
+        if (reportId != 0x08 && reportId != 0x07 && reportId != 0x0A && reportId != 0x0D) return false
 
         val status = packet[1].toInt() and 0xFF
         if ((status and 0xE0) == 0xE0 && length >= 6) {
@@ -177,10 +183,10 @@ class HuionParser(
             out.maxY = maxY
             out.maxPressure = maxPressure
             out.expressKeyMask = (packet[4].toInt() and 0xFF) or ((packet[5].toInt() and 0xFF) shl 8)
+            out.isExpressKeyFrame = true
             return true
         }
 
-        val inRange = (status and 0x80) != 0
         var rawX = (packet[2].toInt() and 0xFF) or ((packet[3].toInt() and 0xFF) shl 8)
         var rawY = (packet[4].toInt() and 0xFF) or ((packet[5].toInt() and 0xFF) shl 8)
         val rawP = (packet[6].toInt() and 0xFF) or ((packet[7].toInt() and 0xFF) shl 8)
@@ -189,6 +195,7 @@ class HuionParser(
             rawX = rawX or ((packet[8].toInt() and 0xFF) shl 16)
             rawY = rawY or ((packet[9].toInt() and 0xFF) shl 16)
         }
+        val inRange = (status and 0x80) != 0 || rawP > 0 || (status != 0x00 && (rawX > 0 || rawY > 0))
 
         out.valid = true
         out.maxX = maxX
@@ -201,8 +208,9 @@ class HuionParser(
         out.isTipDown = inRange && ((status and 0x01) != 0 || rawP > 0)
         out.barrelButton1 = inRange && (status and 0x02) != 0
         out.barrelButton2 = inRange && (status and 0x04) != 0
-        out.isEraser = false
+        out.isEraser = inRange && (status and 0x20) != 0
         out.expressKeyMask = 0
+        out.isExpressKeyFrame = false
 
         if (length >= 12) {
             out.tiltXDeg = packet[10].toInt().toFloat().coerceIn(-60f, 60f)
@@ -303,17 +311,25 @@ class GenericHidDigitizerParser(
     }
 
     override fun parse(packet: ByteArray, length: Int, out: TabletReport): Boolean {
-        if (length < 8) return false
+        if (length < 6) return false
         val status = packet[1].toInt() and 0xFF
-        val rawX = (packet[layout.xByteOffset].toInt() and 0xFF) or
-            ((packet[layout.xByteOffset + 1].toInt() and 0xFF) shl 8)
-        val rawY = (packet[layout.yByteOffset].toInt() and 0xFF) or
-            ((packet[layout.yByteOffset + 1].toInt() and 0xFF) shl 8)
-        val rawP = (packet[layout.pressureByteOffset].toInt() and 0xFF) or
-            ((packet[layout.pressureByteOffset + 1].toInt() and 0xFF) shl 8)
+        val xOff = layout.xByteOffset
+        val yOff = layout.yByteOffset
+        val pOff = layout.pressureByteOffset
+        if (yOff + 1 >= length) return false
+
+        val rawX = (packet[xOff].toInt() and 0xFF) or
+            ((packet[xOff + 1].toInt() and 0xFF) shl 8)
+        val rawY = (packet[yOff].toInt() and 0xFF) or
+            ((packet[yOff + 1].toInt() and 0xFF) shl 8)
+        val rawP = if (pOff + 1 < length) {
+            (packet[pOff].toInt() and 0xFF) or
+                ((packet[pOff + 1].toInt() and 0xFF) shl 8)
+        } else 0
 
         val spanX = (calMaxX - calMinX).coerceAtLeast(1)
         val spanY = (calMaxY - calMinY).coerceAtLeast(1)
+        val explicitlyOut = status == 0xC0 || (status == 0x00 && rawX == 0 && rawY == 0 && rawP == 0)
 
         out.valid = true
         out.maxX = spanX
@@ -322,14 +338,35 @@ class GenericHidDigitizerParser(
         out.rawX = (rawX - calMinX).coerceIn(0, spanX)
         out.rawY = (rawY - calMinY).coerceIn(0, spanY)
         out.rawPressure = rawP.coerceIn(0, layout.logicalMaxPressure)
-        out.isHovering = (status and 0x80) != 0 || rawP > 0 || rawX > 0
-        out.isTipDown = (status and 0x01) != 0 || rawP > 0
-        out.barrelButton1 = (status and 0x02) != 0
-        out.barrelButton2 = (status and 0x04) != 0
+        out.isHovering = !explicitlyOut && ((status and 0x80) != 0 || rawP > 0 || rawX > 0 || rawY > 0)
+        out.isTipDown = out.isHovering && ((status and 0x01) != 0 || rawP > 0)
+        out.barrelButton1 = out.isHovering && (status and 0x02) != 0
+        out.barrelButton2 = out.isHovering && (status and 0x04) != 0
         out.isEraser = false
         out.tiltXDeg = 0f
         out.tiltYDeg = 0f
         out.expressKeyMask = 0
+        out.isExpressKeyFrame = false
         return true
+    }
+}
+
+/**
+ * Resilient wrapper trying the primary brand/profile parser first and automatically falling back
+ * to compatible digitizer parsers when a firmware revision emits alternate Report IDs or layouts.
+ */
+class ResilientTabletParser(
+    private val primary: HidReportParser,
+    private val fallbacks: List<HidReportParser>
+) : HidReportParser {
+    override val name: String = primary.name
+    override val brand: TabletBrand = primary.brand
+
+    override fun parse(packet: ByteArray, length: Int, out: TabletReport): Boolean {
+        if (primary.parse(packet, length, out)) return true
+        for (i in fallbacks.indices) {
+            if (fallbacks[i].parse(packet, length, out)) return true
+        }
+        return false
     }
 }

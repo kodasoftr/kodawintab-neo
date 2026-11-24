@@ -99,12 +99,25 @@ class TabletProfileRepository(private val context: Context) {
         profile: TabletProfileJson,
         rawDescriptors: ByteArray? = null
     ): HidReportParser {
+        val layout = HidDescriptorDecoder.decode(rawDescriptors).copy(
+            logicalMaxX = profile.maxX.coerceAtLeast(1024),
+            logicalMaxY = profile.maxY.coerceAtLeast(1024),
+            logicalMaxPressure = profile.maxPressure.coerceAtLeast(1024)
+        )
+        val generic = GenericHidDigitizerParser(layout)
+        val ugee = UgeeS640Parser(profile.maxX, profile.maxY, profile.maxPressure)
+        val huion = HuionParser(profile.maxX, profile.maxY, profile.maxPressure)
+        val wacom = WacomParser(profile.maxX, profile.maxY, profile.maxPressure)
+
         return when (runCatching { ParserType.valueOf(profile.parserType) }.getOrNull()) {
-            ParserType.UGEE_S640 -> UgeeS640Parser(profile.maxX, profile.maxY, profile.maxPressure)
-            ParserType.WACOM -> WacomParser(profile.maxX, profile.maxY, profile.maxPressure)
-            ParserType.HUION -> HuionParser(profile.maxX, profile.maxY, profile.maxPressure)
-            ParserType.XP_PEN -> XpPenParser(profile.maxX, profile.maxY, profile.maxPressure)
-            else -> GenericHidDigitizerParser(HidDescriptorDecoder.decode(rawDescriptors))
+            ParserType.UGEE_S640 -> ResilientTabletParser(ugee, listOf(huion, wacom, generic))
+            ParserType.WACOM -> ResilientTabletParser(wacom, listOf(ugee, huion, generic))
+            ParserType.HUION -> ResilientTabletParser(huion, listOf(ugee, wacom, generic))
+            ParserType.XP_PEN -> ResilientTabletParser(
+                XpPenParser(profile.maxX, profile.maxY, profile.maxPressure),
+                listOf(huion, wacom, generic)
+            )
+            else -> ResilientTabletParser(generic, listOf(ugee, huion, wacom))
         }
     }
 

@@ -47,9 +47,11 @@ import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -63,6 +65,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.drawscope.Stroke
+import android.os.SystemClock
 import android.view.PointerIcon as AndroidPointerIcon
 import android.view.WindowManager
 import androidx.compose.ui.input.pointer.PointerEventType
@@ -84,12 +87,14 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import androidx.compose.ui.window.DialogWindowProvider
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.example.driver.DriverTelemetry
 import com.example.hub.CursorOverlaySnapshot
 import com.example.hub.CursorRenderMode
 import com.example.ui.theme.CoralError
 import com.example.ui.theme.EmeraldActive
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
 import java.util.Locale
 import kotlin.math.hypot
@@ -105,24 +110,27 @@ private data class SheetStrokeSegment(
 private fun CursorOverlaySnapshot.isGlobalSystemOverlayDrawing(): Boolean {
     return overlayPermissionGranted &&
         activeCursor != null &&
+        activeCursor.sourceFormat != "KODA" &&
         !isPaused &&
-        mode == CursorRenderMode.SIMULATED
+        (mode == CursorRenderMode.SIMULATED || isFromTablet || !nativeCursorApplied)
 }
 
 /**
  * Full-Screen Blank White Paper Sheet for Stroke & Pressure Curve testing (v2.0).
  *
  * Fixes:
- * - Single cursor rendering (no duplicate .cur/.ani/.png icon when global overlay is active)
+ * - Single cursor rendering (never draws white KODA arrow over white sheet; shows custom .cur/.ani/.png or cyan crosshair)
  * - Draws strokes from BOTH Compose touch/stylus/mouse input AND live USB tablet pipeline telemetry
  */
 @Composable
 fun FullScreenBlankSheetStrokeDialog(
-    telemetry: DriverTelemetry,
-    cursorSnapshot: CursorOverlaySnapshot,
-    onFeedTestPacket: (normX: Float, normY: Float, pressure: Float, isDown: Boolean) -> Unit,
+    telemetryFlow: StateFlow<DriverTelemetry>,
+    cursorSnapshotFlow: StateFlow<CursorOverlaySnapshot>,
+    @Suppress("UNUSED_PARAMETER") onFeedTestPacket: (normX: Float, normY: Float, pressure: Float, isDown: Boolean) -> Unit,
     onDismiss: () -> Unit
 ) {
+    val telemetry by telemetryFlow.collectAsStateWithLifecycle()
+    val cursorSnapshot by cursorSnapshotFlow.collectAsStateWithLifecycle()
     val strokes = remember { mutableStateListOf<SheetStrokeSegment>() }
     var sheetSize by remember { mutableStateOf(IntSize(1, 1)) }
     var sheetWindowOrigin by remember { mutableStateOf(Offset.Zero) }
@@ -185,8 +193,10 @@ fun FullScreenBlankSheetStrokeDialog(
     ) {
         val dialogView = LocalView.current
         val context = LocalContext.current
-        val hideNativePointer = cursorSnapshot.isGlobalSystemOverlayDrawing() ||
-            (cursorSnapshot.activeCursor != null && !cursorSnapshot.isPaused && cursorSnapshot.mode == CursorRenderMode.SIMULATED)
+        val hideNativePointer = cursorSnapshot.nativePointerHidden ||
+            cursorSnapshot.isGlobalSystemOverlayDrawing() ||
+            (cursorSnapshot.activeCursor != null && !cursorSnapshot.isPaused &&
+                (cursorSnapshot.mode == CursorRenderMode.SIMULATED || cursorSnapshot.isFromTablet || !cursorSnapshot.nativeCursorApplied))
         val nullAndroidIcon = remember(context) {
             runCatching { AndroidPointerIcon.getSystemIcon(context, AndroidPointerIcon.TYPE_NULL) }.getOrNull()
         }
@@ -451,20 +461,30 @@ private enum class CalibrationPhase {
 /**
  * Full-Screen 5-Point Guided Calibration v2.0 (Intro -> 1 Point at a Time -> Green Save Flash -> Success).
  *
+ * - No white mouse cursor overlay (both in-app sprite, Koda floating overlay, and native OS pointer are hidden)
  * - No instruction popup overlapping target crosshairs
- * - Shows "Começar Calibração" + "Resetar para Padrão de Fábrica" on the intro screen
  * - Displays 1 target point at a time; turns Green when clicked/captured
- * - Never draws a duplicate cursor when system overlay is active, and eliminates jitter feedback loops
+ * - Uses active profile's real rawMaxX/rawMaxY and step timing debounce to prevent accidental double-captures
  */
 @Composable
 fun FullScreenCalibrationDialog(
-    telemetry: DriverTelemetry,
-    cursorSnapshot: CursorOverlaySnapshot,
-    onFeedTestPacket: (normX: Float, normY: Float, pressure: Float, isDown: Boolean) -> Unit,
+    telemetryFlow: StateFlow<DriverTelemetry>,
+    maxRawX: Int = 32767,
+    maxRawY: Int = 32767,
+    onSetCalibrationCursorHidden: (Boolean) -> Unit = {},
+    @Suppress("UNUSED_PARAMETER") onFeedTestPacket: (normX: Float, normY: Float, pressure: Float, isDown: Boolean) -> Unit,
     onApplyCalibration: (minX: Int, maxX: Int, minY: Int, maxY: Int) -> Unit,
     onResetFactoryCalibration: () -> Unit,
     onDismiss: () -> Unit
 ) {
+    DisposableEffect(Unit) {
+        onSetCalibrationCursorHidden(true)
+        onDispose {
+            onSetCalibrationCursorHidden(false)
+        }
+    }
+
+    val telemetry by telemetryFlow.collectAsStateWithLifecycle()
     val targetPoints = remember {
         listOf(
             Offset(0.10f, 0.14f) to "1/5 · Canto Superior Esquerdo",
@@ -482,25 +502,25 @@ fun FullScreenCalibrationDialog(
     val capturedRawX = remember { mutableStateListOf<Int>() }
     val capturedRawY = remember { mutableStateListOf<Int>() }
     var canvasSize by remember { mutableStateOf(IntSize(1, 1)) }
-    var aimCursorPos by remember { mutableStateOf<Offset?>(null) }
     var prevTelemetryTipDown by remember { mutableStateOf(false) }
+    var stepEnteredAtMs by remember { mutableLongStateOf(0L) }
     val scope = rememberCoroutineScope()
-    val showFallbackSprite = !cursorSnapshot.isGlobalSystemOverlayDrawing()
 
     fun commitPointCapture(tapNorm: Offset?) {
         if (phase != CalibrationPhase.CAPTURING || pointConfirmedGreen) return
-        val rawMax = 32767f
+        val safeMaxX = maxRawX.coerceAtLeast(1).toFloat()
+        val safeMaxY = maxRawY.coerceAtLeast(1).toFloat()
         val rx = if (telemetry.lastRawX > 0) {
             telemetry.lastRawX
         } else {
             val fallback = tapNorm ?: targetPoints[currentStep].first
-            (fallback.x * rawMax).roundToInt()
+            (fallback.x * safeMaxX).roundToInt()
         }
         val ry = if (telemetry.lastRawY > 0) {
             telemetry.lastRawY
         } else {
             val fallback = tapNorm ?: targetPoints[currentStep].first
-            (fallback.y * rawMax).roundToInt()
+            (fallback.y * safeMaxY).roundToInt()
         }
         capturedRawX.add(rx)
         capturedRawY.add(ry)
@@ -511,13 +531,14 @@ fun FullScreenCalibrationDialog(
             pointConfirmedGreen = false
             if (currentStep < 4) {
                 currentStep++
+                stepEnteredAtMs = SystemClock.uptimeMillis()
             } else {
                 val cornerXs = capturedRawX.take(4)
                 val cornerYs = capturedRawY.take(4)
                 val minX = cornerXs.minOrNull() ?: 320
-                val maxX = cornerXs.maxOrNull() ?: 32440
+                val maxX = cornerXs.maxOrNull() ?: (safeMaxX * 0.99f).roundToInt()
                 val minY = cornerYs.minOrNull() ?: 320
-                val maxY = cornerYs.maxOrNull() ?: 32440
+                val maxY = cornerYs.maxOrNull() ?: (safeMaxY * 0.99f).roundToInt()
                 onApplyCalibration(minX, maxX, minY, maxY)
                 phase = CalibrationPhase.COMPLETED
                 delay(850L)
@@ -526,21 +547,17 @@ fun FullScreenCalibrationDialog(
         }
     }
 
-    // Track real tablet stylus tip press without bouncing feedback loops
+    // Track real tablet stylus tip press without bouncing feedback loops or capturing the Start click
     LaunchedEffect(
         telemetry.totalPackets,
-        telemetry.lastScreenX,
-        telemetry.lastScreenY,
-        telemetry.isPenInRange,
         telemetry.isTipDown
     ) {
-        if (canvasSize.width > 1 && canvasSize.height > 1 && (telemetry.isPenInRange || telemetry.isTipDown)) {
-            aimCursorPos = Offset(
-                telemetry.lastScreenX.coerceIn(0f, canvasSize.width.toFloat()),
-                telemetry.lastScreenY.coerceIn(0f, canvasSize.height.toFloat())
-            )
-        }
-        if (phase == CalibrationPhase.CAPTURING && telemetry.isTipDown && !prevTelemetryTipDown) {
+        val nowMs = SystemClock.uptimeMillis()
+        if (phase == CalibrationPhase.CAPTURING &&
+            telemetry.isTipDown &&
+            !prevTelemetryTipDown &&
+            (nowMs - stepEnteredAtMs) >= 220L
+        ) {
             val nx = if (canvasSize.width > 1) (telemetry.lastScreenX / canvasSize.width).coerceIn(0f, 1f) else null
             val ny = if (canvasSize.height > 1) (telemetry.lastScreenY / canvasSize.height).coerceIn(0f, 1f) else null
             commitPointCapture(if (nx != null && ny != null) Offset(nx, ny) else null)
@@ -557,12 +574,10 @@ fun FullScreenCalibrationDialog(
     ) {
         val dialogView = LocalView.current
         val context = LocalContext.current
-        val hideNativePointer = cursorSnapshot.isGlobalSystemOverlayDrawing() ||
-            (cursorSnapshot.activeCursor != null && !cursorSnapshot.isPaused && cursorSnapshot.mode == CursorRenderMode.SIMULATED)
         val nullAndroidIcon = remember(context) {
             runCatching { AndroidPointerIcon.getSystemIcon(context, AndroidPointerIcon.TYPE_NULL) }.getOrNull()
         }
-        LaunchedEffect(dialogView, hideNativePointer, cursorSnapshot.mode, cursorSnapshot.activeCursor) {
+        LaunchedEffect(dialogView, nullAndroidIcon) {
             (dialogView.parent as? DialogWindowProvider)?.window?.let { win ->
                 if (!android.os.Build.FINGERPRINT.equals("robolectric", ignoreCase = true)) {
                     val lp = win.attributes
@@ -571,11 +586,7 @@ fun FullScreenCalibrationDialog(
                         win.attributes = lp
                     }
                 }
-                win.decorView.pointerIcon = when {
-                    hideNativePointer -> nullAndroidIcon
-                    cursorSnapshot.mode == CursorRenderMode.NATIVE -> cursorSnapshot.activeCursor?.pointerIcon
-                    else -> null
-                }
+                win.decorView.pointerIcon = nullAndroidIcon
             }
         }
 
@@ -583,7 +594,7 @@ fun FullScreenCalibrationDialog(
             .fillMaxSize()
             .background(Color(0xFF0A0C18))
             .let { base ->
-                if (hideNativePointer && nullAndroidIcon != null) {
+                if (nullAndroidIcon != null) {
                     base.pointerHoverIcon(ComposePointerIcon(nullAndroidIcon), overrideDescendants = true)
                 } else {
                     base
@@ -671,6 +682,8 @@ fun FullScreenCalibrationDialog(
                                         capturedRawX.clear()
                                         capturedRawY.clear()
                                         pointConfirmedGreen = false
+                                        prevTelemetryTipDown = true
+                                        stepEnteredAtMs = SystemClock.uptimeMillis()
                                         phase = CalibrationPhase.CAPTURING
                                     },
                                     modifier = Modifier
@@ -724,10 +737,11 @@ fun FullScreenCalibrationDialog(
                             .fillMaxSize()
                             .pointerInput(currentStep, pointConfirmedGreen) {
                                 detectTapGestures { offset ->
-                                    aimCursorPos = offset
-                                    val nx = (offset.x / canvasSize.width.coerceAtLeast(1)).coerceIn(0f, 1f)
-                                    val ny = (offset.y / canvasSize.height.coerceAtLeast(1)).coerceIn(0f, 1f)
-                                    commitPointCapture(Offset(nx, ny))
+                                    if (SystemClock.uptimeMillis() - stepEnteredAtMs >= 160L) {
+                                        val nx = (offset.x / canvasSize.width.coerceAtLeast(1)).coerceIn(0f, 1f)
+                                        val ny = (offset.y / canvasSize.height.coerceAtLeast(1)).coerceIn(0f, 1f)
+                                        commitPointCapture(Offset(nx, ny))
+                                    }
                                 }
                             }
                     ) {
@@ -830,15 +844,6 @@ fun FullScreenCalibrationDialog(
                                 }
                             }
                         }
-
-                        if (showFallbackSprite) {
-                            aimCursorPos?.let { pos ->
-                                InAppActiveCursorSprite(
-                                    cursorSnapshot = cursorSnapshot,
-                                    position = pos
-                                )
-                            }
-                        }
                     }
                 }
 
@@ -886,7 +891,8 @@ fun FullScreenCalibrationDialog(
 }
 
 /**
- * Tip-aligned .cur/.ani/.png cursor renderer fallback when system overlay window is not active.
+ * Tip-aligned custom .cur/.ani/.png cursor renderer fallback for the test drawing sheet.
+ * Built-in "KODA" white arrow is replaced with a crisp cyan crosshair on light/test surfaces.
  */
 @Composable
 fun BoxScope.InAppActiveCursorSprite(
@@ -896,7 +902,7 @@ fun BoxScope.InAppActiveCursorSprite(
     val active = cursorSnapshot.activeCursor
     val density = LocalDensity.current
 
-    if (active != null) {
+    if (active != null && active.sourceFormat != "KODA") {
         val scale = cursorSnapshot.cursorScale
         val bmp = active.frames.getOrNull(cursorSnapshot.currentFrameIndex) ?: active.bitmap
         val wPx = (bmp.width * scale).roundToInt().coerceAtLeast(16)

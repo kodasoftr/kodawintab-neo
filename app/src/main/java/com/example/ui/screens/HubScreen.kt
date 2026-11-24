@@ -122,7 +122,8 @@ fun HubScreen(
     onChangeCursorScale: (Float) -> Unit,
     onGrantOverlayViaAdb: () -> Unit,
     onToggleSimulatedAppClosed: (String, String) -> Unit,
-    onDismissCoopBanner: () -> Unit
+    onDismissCoopBanner: () -> Unit,
+    onOpenAccessibilitySettings: () -> Unit = {}
 ) {
     val context = LocalContext.current
     var pickingDeviceForSlot by remember { mutableStateOf<HubSlotId?>(null) }
@@ -251,7 +252,8 @@ fun HubScreen(
                                 )
                                 context.startActivity(intent)
                             }
-                        }
+                        },
+                        onOpenAccessibilitySettings = onOpenAccessibilitySettings
                     )
                 }
 
@@ -476,7 +478,8 @@ private fun GlobalCursorSettingsCard(
     onSelectMode: (CursorRenderMode) -> Unit,
     onChangeScale: (Float) -> Unit,
     onGrantViaAdb: () -> Unit,
-    onOpenOverlaySettings: () -> Unit
+    onOpenOverlaySettings: () -> Unit,
+    onOpenAccessibilitySettings: () -> Unit
 ) {
     Card(
         colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
@@ -609,12 +612,49 @@ private fun GlobalCursorSettingsCard(
                         )
                         Text(
                             text = if (snapshot.overlayPermissionGranted) {
-                                "Cursor por cima de tudo ATIVO (Overlay do sistema liberado)"
+                                "Cursor por cima de tudo ATIVO (seta nativa do sistema suprimida para não duplicar)"
                             } else {
                                 "Permita 'Sobrepor a outros apps' para o cursor ficar acima de todos os aplicativos"
                             },
                             style = MaterialTheme.typography.labelSmall
                         )
+                    }
+                }
+            }
+
+            Surface(
+                color = if (snapshot.accessibilityServiceEnabled) {
+                    EmeraldActive.copy(alpha = 0.14f)
+                } else {
+                    MaterialTheme.colorScheme.primary.copy(alpha = 0.12f)
+                },
+                shape = MaterialTheme.shapes.small,
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(10.dp),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        text = if (snapshot.accessibilityServiceEnabled) {
+                            "Cliques & Arrasto Globais ATIVOS sem PC (Acessibilidade liberada)"
+                        } else {
+                            "Ative 'Acessibilidade > Koda WinTab' para clicar e arrastar em qualquer app sem PC + assumir mouse USB sem cursor duplo."
+                        },
+                        style = MaterialTheme.typography.labelSmall,
+                        modifier = Modifier.weight(1f)
+                    )
+                    if (!snapshot.accessibilityServiceEnabled) {
+                        Spacer(Modifier.width(8.dp))
+                        FilledTonalButton(
+                            onClick = onOpenAccessibilitySettings,
+                            modifier = Modifier.height(40.dp)
+                        ) {
+                            Text("Ativar", maxLines = 1)
+                        }
                     }
                 }
             }

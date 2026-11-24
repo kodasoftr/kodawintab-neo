@@ -138,7 +138,10 @@ class TabletPipeline(
             maxNativePressure = profile.maxPressure,
             effectiveRotationDeg = matrix.effectiveRotationDeg,
             effectiveDpiX = effDpiX,
-            effectiveDpiY = effDpiY
+            effectiveDpiY = effDpiY,
+            activeWidthMm = matrix.activeWidthMm,
+            activeHeightMm = matrix.activeHeightMm,
+            pxPerMmX = matrix.effectivePxPerMmX
         )
     }
 
@@ -154,8 +157,8 @@ class TabletPipeline(
             while (running.get()) {
                 var processed = 0
                 batchBuffer.clear()
-                var lastAction = MotionEvent.ACTION_HOVER_MOVE
-                var lastEraser = false
+                var batchAction = MotionEvent.ACTION_HOVER_MOVE
+                var batchEraser = false
 
                 while (processed < 8) {
                     val len = ringBuffer.poll(scratchPacket, scratchMeta)
@@ -169,8 +172,13 @@ class TabletPipeline(
 
                     // Dispatch custom keyboard/shortcut bindings for Express Keys & Pen Barrel Buttons
                     dispatchButtonAndExpressBindings(scratchReport)
-                    if (scratchReport.expressKeyMask != 0) {
-                        // Express-key-only frame does not contain pen coordinates
+                    if (scratchReport.isExpressKeyFrame) {
+                        // Express-key frame (both press and release 0xF0) does not contain pen coordinates
+                        continue
+                    }
+
+                    // Ignore idle out-of-range reports (0xC0 / zeroed idle) once hover/tip have already exited
+                    if (!scratchReport.isHovering && !scratchReport.isTipDown && !prevTipDown && !prevHovering) {
                         continue
                     }
 
@@ -223,14 +231,21 @@ class TabletPipeline(
                         scratchReport.rawPressure,
                         scratchReport.maxPressure
                     )
+                    val effectivePressure = if (scratchReport.isTipDown) {
+                        curvedPressure.coerceAtLeast(0.02f)
+                    } else {
+                        0f
+                    }
                     val t2 = System.nanoTime()
 
+                    val wasTipDown = prevTipDown
+                    val wasHovering = prevHovering
                     val action = when {
-                        scratchReport.isTipDown && !prevTipDown -> MotionEvent.ACTION_DOWN
-                        scratchReport.isTipDown && prevTipDown -> MotionEvent.ACTION_MOVE
-                        !scratchReport.isTipDown && prevTipDown -> MotionEvent.ACTION_UP
-                        scratchReport.isHovering && !prevHovering -> MotionEvent.ACTION_HOVER_ENTER
-                        !scratchReport.isHovering && prevHovering -> MotionEvent.ACTION_HOVER_EXIT
+                        scratchReport.isTipDown && !wasTipDown -> MotionEvent.ACTION_DOWN
+                        scratchReport.isTipDown && wasTipDown -> MotionEvent.ACTION_MOVE
+                        !scratchReport.isTipDown && wasTipDown -> MotionEvent.ACTION_UP
+                        scratchReport.isHovering && !wasHovering -> MotionEvent.ACTION_HOVER_ENTER
+                        !scratchReport.isHovering && wasHovering -> MotionEvent.ACTION_HOVER_EXIT
                         else -> MotionEvent.ACTION_HOVER_MOVE
                     }
                     prevTipDown = scratchReport.isTipDown
@@ -241,8 +256,6 @@ class TabletPipeline(
                     val eraserActive = scratchReport.isEraser ||
                         (scratchReport.barrelButton1 && b1Action.isEraserToggle) ||
                         (scratchReport.barrelButton2 && b2Action.isEraserToggle)
-                    lastAction = action
-                    lastEraser = eraserActive
 
                     var buttons = 0
                     if (scratchReport.barrelButton1) {
@@ -264,31 +277,54 @@ class TabletPipeline(
                     }
 
                     if (engineClient.state.value.isActive) {
+                        val isSingleTransition = action == MotionEvent.ACTION_DOWN ||
+                            action == MotionEvent.ACTION_UP ||
+                            action == MotionEvent.ACTION_HOVER_ENTER ||
+                            action == MotionEvent.ACTION_HOVER_EXIT
+                        if (batchBuffer.isNotEmpty() && (isSingleTransition || action != batchAction || eraserActive != batchEraser)) {
+                            engineClient.sendStylusBatch(
+                                deviceId = virtualDeviceId,
+                                displayId = config.targetDisplayId,
+                                action = batchAction,
+                                isEraser = batchEraser,
+                                samples = batchBuffer
+                            )
+                            batchBuffer.clear()
+                        }
+                        batchAction = action
+                        batchEraser = eraserActive
                         batchBuffer.add(
                             StylusSample(
                                 eventTimeMs = SystemClock.uptimeMillis(),
                                 x = scratchScreenXY[0],
                                 y = scratchScreenXY[1],
-                                pressure = curvedPressure,
+                                pressure = effectivePressure,
                                 tiltX = scratchReport.tiltXDeg,
                                 tiltY = scratchReport.tiltYDeg,
                                 buttonState = buttons
                             )
                         )
-                        // Flush batch immediately on state transition (DOWN / UP) or when batch reaches 4
-                        val isTransition = action == MotionEvent.ACTION_DOWN || action == MotionEvent.ACTION_UP
-                        if (isTransition || batchBuffer.size >= 4) {
+                        if (isSingleTransition || batchBuffer.size >= 4) {
                             engineClient.sendStylusBatch(
                                 deviceId = virtualDeviceId,
                                 displayId = config.targetDisplayId,
-                                action = lastAction,
-                                isEraser = lastEraser,
+                                action = batchAction,
+                                isEraser = batchEraser,
                                 samples = batchBuffer
                             )
                             batchBuffer.clear()
                         }
-                    } else if (batchBuffer.isNotEmpty()) {
-                        batchBuffer.clear()
+                    } else {
+                        if (batchBuffer.isNotEmpty()) batchBuffer.clear()
+                        // Standalone PC-free global stylus stroke dispatch via KodaAccessibilityService
+                        val a11y = com.example.hub.KodaAccessibilityService.activeInstance()
+                        if (a11y != null && !a11y.isForegroundInOwnApp()) {
+                            when (action) {
+                                MotionEvent.ACTION_DOWN -> a11y.dispatchPointerDown(scratchScreenXY[0], scratchScreenXY[1])
+                                MotionEvent.ACTION_MOVE -> a11y.dispatchPointerMove(scratchScreenXY[0], scratchScreenXY[1])
+                                MotionEvent.ACTION_UP -> a11y.dispatchPointerUp(scratchScreenXY[0], scratchScreenXY[1])
+                            }
+                        }
                     }
                     val t3End = System.nanoTime()
 
@@ -318,7 +354,7 @@ class TabletPipeline(
                             lastScreenY = scratchScreenXY[1],
                             lastRawPressure = scratchReport.rawPressure,
                             maxNativePressure = scratchReport.maxPressure,
-                            lastCurvedPressure = curvedPressure,
+                            lastCurvedPressure = effectivePressure,
                             lastTiltX = scratchReport.tiltXDeg,
                             lastTiltY = scratchReport.tiltYDeg,
                             isPenInRange = scratchReport.isHovering,
@@ -326,6 +362,9 @@ class TabletPipeline(
                             effectiveRotationDeg = matrix.effectiveRotationDeg,
                             effectiveDpiX = matrix.effectiveDpiX,
                             effectiveDpiY = matrix.effectiveDpiY,
+                            activeWidthMm = matrix.activeWidthMm,
+                            activeHeightMm = matrix.activeHeightMm,
+                            pxPerMmX = matrix.effectivePxPerMmX,
                             lastTriggeredShortcut = lastShortcutLabel
                         )
                     }
@@ -335,8 +374,8 @@ class TabletPipeline(
                     engineClient.sendStylusBatch(
                         deviceId = virtualDeviceId,
                         displayId = config.targetDisplayId,
-                        action = lastAction,
-                        isEraser = lastEraser,
+                        action = batchAction,
+                        isEraser = batchEraser,
                         samples = batchBuffer
                     )
                     batchBuffer.clear()
@@ -359,14 +398,30 @@ class TabletPipeline(
         if (report.barrelButton1 != prevBarrel1) {
             prevBarrel1 = report.barrelButton1
             val act = bindings.button1Action
-            KeyBindingCatalog.dispatchBindingPress(engineClient, kbDevId, act, report.barrelButton1)
+            if (engineClient.state.value.isActive) {
+                KeyBindingCatalog.dispatchBindingPress(engineClient, kbDevId, act, report.barrelButton1)
+            } else if (report.barrelButton1) {
+                val a11y = com.example.hub.KodaAccessibilityService.activeInstance()
+                if (a11y != null && !a11y.isForegroundInOwnApp()) {
+                    if (cachedB1Action.isRightClick) a11y.performSystemBack()
+                    else if (cachedB1Action.isMiddleClick) a11y.performSystemHome()
+                }
+            }
             if (report.barrelButton1) lastShortcutLabel = "Caneta 1 → $act"
         }
 
         if (report.barrelButton2 != prevBarrel2) {
             prevBarrel2 = report.barrelButton2
             val act = bindings.button2Action
-            KeyBindingCatalog.dispatchBindingPress(engineClient, kbDevId, act, report.barrelButton2)
+            if (engineClient.state.value.isActive) {
+                KeyBindingCatalog.dispatchBindingPress(engineClient, kbDevId, act, report.barrelButton2)
+            } else if (report.barrelButton2) {
+                val a11y = com.example.hub.KodaAccessibilityService.activeInstance()
+                if (a11y != null && !a11y.isForegroundInOwnApp()) {
+                    if (cachedB2Action.isRightClick) a11y.performSystemBack()
+                    else if (cachedB2Action.isMiddleClick) a11y.performSystemHome()
+                }
+            }
             if (report.barrelButton2) lastShortcutLabel = "Caneta 2 → $act"
         }
 
@@ -425,6 +480,8 @@ class TabletPipeline(
         filters.reset()
         lastRelRawX = -1f
         lastRelRawY = -1f
+        prevTipDown = false
+        prevHovering = false
         prevBarrel1 = false
         prevBarrel2 = false
         prevExpressMask = 0

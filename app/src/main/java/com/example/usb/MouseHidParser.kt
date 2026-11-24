@@ -16,9 +16,10 @@ class MouseHidParser {
     fun parse(packet: ByteArray, length: Int, sensitivity: Float = 1.0f): Boolean {
         if (length < 3) return false
 
-        // Some wireless receivers prepend a 1-byte Report ID (0x01 or 0x02) before buttons/X/Y
-        val offset = if (length >= 5 && (packet[0] == 0x01.toByte() || packet[0] == 0x02.toByte()) &&
-            (packet[1].toInt() and 0xF8) == 0
+        // Some wireless receivers or gaming mice prepend a 1-byte Report ID (0x01..0x04) before buttons/X/Y
+        val first = packet[0].toInt() and 0xFF
+        val offset = if (length >= 5 && first in 1..4 &&
+            (packet[1].toInt() and 0xF0) == 0
         ) {
             1
         } else {
@@ -31,19 +32,19 @@ class MouseHidParser {
         buttonRight = (btnByte and 0x02) != 0
         buttonMiddle = (btnByte and 0x04) != 0
 
-        // Standard 8-bit signed relative deltas (USB Boot Mouse) or 12/16-bit LE if packet >= 6
+        // Standard 8-bit signed relative deltas (USB Boot Mouse) or 16-bit LE if packet >= 6
         val dx: Int
         val dy: Int
         val wheelIdx: Int
-        if (length - offset >= 6 && (packet[offset + 1].toInt() != 0 || packet[offset + 2].toInt() != 0 ||
+        val rem = length - offset
+        if (rem >= 6 && (packet[offset + 1].toInt() != 0 || packet[offset + 2].toInt() != 0 ||
                 packet[offset + 3].toInt() != 0 || packet[offset + 4].toInt() != 0)
         ) {
-            // Check whether bytes look like 16-bit LE signed vs 8-bit signed + wheel
             val b1 = packet[offset + 1].toInt()
             val b2 = packet[offset + 2].toInt()
             val b3 = packet[offset + 3].toInt()
             val b4 = packet[offset + 4].toInt()
-            val likely16Bit = (b2 == 0 || b2 == -1) && (b4 == 0 || b4 == -1) && length - offset >= 6
+            val likely16Bit = (b2 == 0 || b2 == -1) && (b4 == 0 || b4 == -1)
             if (likely16Bit) {
                 dx = ((b2 shl 8) or (b1 and 0xFF)).toShort().toInt()
                 dy = ((b4 shl 8) or (b3 and 0xFF)).toShort().toInt()

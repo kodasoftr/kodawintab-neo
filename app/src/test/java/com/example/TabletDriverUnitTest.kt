@@ -358,4 +358,201 @@ class TabletDriverUnitTest {
         assertEquals(expectedX, out[0], 0.5f)
         assertEquals(expectedY, out[1], 0.5f)
     }
+
+    @Test
+    fun `manual dpi 240 vs 640 scales active physical tablet dimensions and stroke coordinates`() {
+        val matrixLowDpi = CoordinateMatrix()
+        val matrixHighDpi = CoordinateMatrix()
+        val outLow = FloatArray(2)
+        val outHigh = FloatArray(2)
+
+        matrixLowDpi.rebuild(
+            tabletMaxX = 32767,
+            tabletMaxY = 32767,
+            activeArea = ActiveAreaRect(),
+            screenArea = ActiveAreaRect(),
+            displayWidthPx = 1080f,
+            displayHeightPx = 2400f,
+            manualRotationDeg = 0,
+            autoRotation = true,
+            displayRotationDeg = 0,
+            invertX = false,
+            invertY = false,
+            dpiMode = com.example.driver.DpiNormalizationMode.MANUAL,
+            targetDpiX = 240f,
+            targetDpiY = 240f,
+            tabletWidthMm = 160f,
+            tabletHeightMm = 100f
+        )
+
+        matrixHighDpi.rebuild(
+            tabletMaxX = 32767,
+            tabletMaxY = 32767,
+            activeArea = ActiveAreaRect(),
+            screenArea = ActiveAreaRect(),
+            displayWidthPx = 1080f,
+            displayHeightPx = 2400f,
+            manualRotationDeg = 0,
+            autoRotation = true,
+            displayRotationDeg = 0,
+            invertX = false,
+            invertY = false,
+            dpiMode = com.example.driver.DpiNormalizationMode.MANUAL,
+            targetDpiX = 640f,
+            targetDpiY = 640f,
+            tabletWidthMm = 160f,
+            tabletHeightMm = 100f
+        )
+
+        assertTrue(matrixLowDpi.activeWidthMm > matrixHighDpi.activeWidthMm + 15f)
+        matrixLowDpi.transform(18500f, 16383f, outLow)
+        matrixHighDpi.transform(18500f, 16383f, outHigh)
+        assertTrue(outHigh[0] > outLow[0] + 40f)
+    }
+
+    @Test
+    fun `auto dpi keeps constant stroke density between portrait and landscape without upside down flip`() {
+        val portrait = CoordinateMatrix()
+        val landscape = CoordinateMatrix()
+        val outP = FloatArray(2)
+        val outL = FloatArray(2)
+
+        portrait.rebuild(
+            tabletMaxX = 32767,
+            tabletMaxY = 32767,
+            activeArea = ActiveAreaRect(),
+            screenArea = ActiveAreaRect(),
+            displayWidthPx = 1080f,
+            displayHeightPx = 2400f,
+            manualRotationDeg = 0,
+            autoRotation = true,
+            displayRotationDeg = 0,
+            invertX = false,
+            invertY = false,
+            rotateAxesWithScreen = false,
+            dpiMode = com.example.driver.DpiNormalizationMode.AUTO,
+            targetDpiX = 440f,
+            targetDpiY = 440f,
+            tabletWidthMm = 160f,
+            tabletHeightMm = 100f
+        )
+
+        landscape.rebuild(
+            tabletMaxX = 32767,
+            tabletMaxY = 32767,
+            activeArea = ActiveAreaRect(),
+            screenArea = ActiveAreaRect(),
+            displayWidthPx = 2400f,
+            displayHeightPx = 1080f,
+            manualRotationDeg = 0,
+            autoRotation = true,
+            displayRotationDeg = 90,
+            invertX = false,
+            invertY = false,
+            rotateAxesWithScreen = false,
+            dpiMode = com.example.driver.DpiNormalizationMode.AUTO,
+            targetDpiX = 440f,
+            targetDpiY = 440f,
+            tabletWidthMm = 160f,
+            tabletHeightMm = 100f
+        )
+
+        // Constant physical px/mm density in Portrait and Landscape -> stroke never feels heavier!
+        assertEquals(portrait.effectivePxPerMmX, landscape.effectivePxPerMmX, 0.5f)
+        // Not upside down: top-left stays top-left (below center), bottom-right stays bottom-right
+        landscape.transform(10000f, 10000f, outL)
+        landscape.transform(22000f, 22000f, outP)
+        assertTrue(outP[0] > outL[0])
+        assertTrue(outP[1] > outL[1])
+        assertEquals(0, landscape.effectiveRotationDeg)
+    }
+
+    @Test
+    fun `resilient tablet parser decodes 6 to 12 byte reports across ugee huion and generic variants`() {
+        val report = TabletReport()
+        val resilient = com.example.driver.ResilientTabletParser(
+            primary = UgeeS640Parser(),
+            fallbacks = listOf(HuionParser(), com.example.driver.GenericHidDigitizerParser())
+        )
+
+        // 1. Short 6-byte Ugee report (hover without pressure/tilt bytes)
+        val shortUgee = byteArrayOf(0x07, 0xA0.toByte(), 0x20, 0x10, 0x40, 0x20)
+        assertTrue(resilient.parse(shortUgee, shortUgee.size, report))
+        assertEquals(0x1020, report.rawX)
+        assertEquals(0x2040, report.rawY)
+        assertTrue(report.isHovering)
+        assertFalse(report.isTipDown)
+
+        // 2. Alternate Huion report ID 0x0D falls back to HuionParser seamlessly
+        val huionAlt = byteArrayOf(0x0D, 0x81.toByte(), 0x10, 0x20, 0x30, 0x40, 0x00, 0x08)
+        assertTrue(resilient.parse(huionAlt, huionAlt.size, report))
+        assertEquals(0x2010, report.rawX)
+        assertEquals(0x4030, report.rawY)
+        assertEquals(2048, report.rawPressure)
+        assertTrue(report.isTipDown)
+
+        // 3. Unlisted vendor report ID 0x15 falls back to GenericHidDigitizerParser
+        val genericPkt = byteArrayOf(0x15, 0x81.toByte(), 0x50, 0x05, 0x60, 0x06, 0xFF.toByte(), 0x0F)
+        assertTrue(resilient.parse(genericPkt, genericPkt.size, report))
+        assertEquals(0x0550, report.rawX)
+        assertEquals(0x0660, report.rawY)
+        assertEquals(4095, report.rawPressure)
+    }
+
+    @Test
+    fun `known tablet vids include uclogic hanvon and bosto alongside wacom huion ugee`() {
+        val vids = com.example.usb.UsbTabletCoordinator.KNOWN_TABLET_VIDS
+        assertTrue(com.example.usb.UsbTabletCoordinator.VID_WACOM in vids)
+        assertTrue(com.example.usb.UsbTabletCoordinator.VID_HUION in vids)
+        assertTrue(com.example.usb.UsbTabletCoordinator.VID_UGEE_XPPEN in vids)
+        assertTrue(com.example.usb.UsbTabletCoordinator.VID_UCLOGIC in vids)
+        assertTrue(com.example.usb.UsbTabletCoordinator.VID_HANVON in vids)
+        assertTrue(com.example.usb.UsbTabletCoordinator.VID_BOSTO in vids)
+        assertTrue(com.example.usb.UsbTabletCoordinator.VID_VEIKK in vids)
+    }
+
+    @Test
+    fun `express key press and release frames flag isExpressKeyFrame without warping stylus`() {
+        val report = TabletReport()
+        val ugee = UgeeS640Parser()
+
+        // Press express key
+        val ugeePress = byteArrayOf(0x02, 0xF0.toByte(), 0x04, 0x00, 0x00, 0x00, 0x00, 0x00)
+        assertTrue(ugee.parse(ugeePress, ugeePress.size, report))
+        assertTrue(report.isExpressKeyFrame)
+        assertEquals(0x0004, report.expressKeyMask)
+
+        // Release express key (mask 0x0000) still flags isExpressKeyFrame = true so pipeline won't warp cursor to (0,0)
+        val ugeeRelease = byteArrayOf(0x02, 0xF0.toByte(), 0x00, 0x00, 0x00, 0x00, 0x00, 0x00)
+        assertTrue(ugee.parse(ugeeRelease, ugeeRelease.size, report))
+        assertTrue(report.isExpressKeyFrame)
+        assertEquals(0, report.expressKeyMask)
+
+        // Subsequent normal stylus frame clears isExpressKeyFrame
+        val stylusPkt = byteArrayOf(0x02, 0xA1.toByte(), 0x20, 0x10, 0x40, 0x20, 0x00, 0x08, 12, (-8).toByte())
+        assertTrue(ugee.parse(stylusPkt, stylusPkt.size, report))
+        assertFalse(report.isExpressKeyFrame)
+        assertTrue(report.isTipDown)
+
+        // Wacom express key release (report ID 0x11)
+        val wacom = WacomParser()
+        val wacomRel = byteArrayOf(0x11, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00)
+        assertTrue(wacom.parse(wacomRel, wacomRel.size, report))
+        assertTrue(report.isExpressKeyFrame)
+
+        // Huion express key frame (status & 0xE0 == 0xE0) and Huion eraser bit (status & 0x20)
+        val huion = HuionParser()
+        val huionKey = byteArrayOf(0x08, 0xE0.toByte(), 0x01, 0x01, 0x00, 0x00, 0x00, 0x00)
+        assertTrue(huion.parse(huionKey, huionKey.size, report))
+        assertTrue(report.isExpressKeyFrame)
+
+        val huionEraser = byteArrayOf(0x08, 0xA1.toByte(), 0x10, 0x20, 0x30, 0x40, 0x00, 0x10)
+        assertTrue(huion.parse(huionEraser, huionEraser.size, report))
+        assertFalse(report.isExpressKeyFrame)
+        assertTrue(report.isEraser)
+        assertTrue(report.isTipDown)
+    }
 }
+
+
+

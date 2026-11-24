@@ -5,4 +5,6 @@
     <string name="koda_engine_active">Koda Engine Ativa (Shell UID 2000)</string>
     <string name="koda_engine_inactive">Koda Engine Inativa</string>
     <string name="coop_toast_message">App fechado — dispositivos em modo Coop</string>
+    <string name="koda_accessibility_service_label">Koda Cursor Global &amp; Mesa WinTab</string>
+    <string name="koda_accessibility_service_desc">Permite que o cursor personalizado (.cur / .ani / .png) clique, arraste, role e controle todo o sistema Android e outros aplicativos com USB OTG sem precisar de PC.</string>
 </resources>

@@ -41,6 +41,7 @@ import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
 import androidx.navigation.compose.rememberNavController
 import com.example.hub.CursorRenderMode
+import com.example.hub.DecodedCursor
 import com.example.service.KodaHubForegroundService
 import com.example.ui.KodaViewModel
 import com.example.ui.screens.ActivationScreen
@@ -51,6 +52,8 @@ import com.example.ui.screens.PrivilegeStatusScreen
 import com.example.ui.screens.TabletDriverScreen
 import com.example.ui.theme.KodaWintabTheme
 import com.example.usb.UsbPeripheralKind
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.map
 
 object KodaRoutes {
     const val ROUTE_ACTIVATION = "activation"
@@ -60,6 +63,17 @@ object KodaRoutes {
     const val ROUTE_HUB = "hub"
     const val ROUTE_PEN_DISPLAY = "pen_display"
 }
+
+private data class RootCursorMeta(
+    val activeCursor: DecodedCursor? = null,
+    val mode: CursorRenderMode = CursorRenderMode.SIMULATED,
+    val isPaused: Boolean = false,
+    val nativePointerHidden: Boolean = false,
+    val isFromTablet: Boolean = false,
+    val nativeCursorApplied: Boolean = false,
+    val overlayPermissionGranted: Boolean = false,
+    val accessibilityServiceEnabled: Boolean = false
+)
 
 class MainActivity : ComponentActivity() {
 
@@ -116,6 +130,7 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun forwardPointerToCursorOverlay(ev: MotionEvent) {
+        if (ev.device?.isVirtual == true) return
         val tool = if (ev.pointerCount > 0) ev.getToolType(0) else MotionEvent.TOOL_TYPE_UNKNOWN
         val isStylus = tool == MotionEvent.TOOL_TYPE_STYLUS ||
             tool == MotionEvent.TOOL_TYPE_ERASER ||
@@ -123,12 +138,15 @@ class MainActivity : ComponentActivity() {
         val isMouse = tool == MotionEvent.TOOL_TYPE_MOUSE ||
             (ev.source and InputDevice.SOURCE_MOUSE) == InputDevice.SOURCE_MOUSE
         if (isStylus || isMouse) {
+            val app = application as? KodaWintabApp ?: return
+            // Do NOT let raw uncalibrated Android OS MotionEvents overwrite our USB HID TabletPipeline or USB Mouse reader!
+            if (isStylus && app.usbCoordinator.hasActiveTabletSession()) return
+            if (isMouse && app.usbCoordinator.hasActiveMouseSession()) return
             val rx = ev.rawX
             val ry = ev.rawY
             if (!rx.isFinite() || !ry.isFinite()) return
-            val app = application as? KodaWintabApp ?: return
-            val visible = ev.actionMasked != MotionEvent.ACTION_HOVER_EXIT &&
-                ev.actionMasked != MotionEvent.ACTION_CANCEL
+            // Keep custom cursor visible globally even when leaving MainActivity (ACTION_HOVER_EXIT)
+            val visible = ev.actionMasked != MotionEvent.ACTION_CANCEL
             app.cursorOverlayManager.updateCursorPosition(
                 x = rx,
                 y = ry,
@@ -170,14 +188,42 @@ fun KodaWintabRoot(
     val selectedSlot by viewModel.selectedSlot.collectAsStateWithLifecycle()
     val tabletConfig by viewModel.tabletConfig.collectAsStateWithLifecycle()
     val availableProfiles by viewModel.availableProfiles.collectAsStateWithLifecycle()
-    val telemetryMesa1 by viewModel.telemetryMesa1.collectAsStateWithLifecycle()
-    val hexFrames by viewModel.hexFrames.collectAsStateWithLifecycle()
     val statusToast by viewModel.statusToast.collectAsStateWithLifecycle()
-    val cursorSnapshot by viewModel.cursorSnapshot.collectAsStateWithLifecycle()
     val penDisplayState by viewModel.penDisplayState.collectAsStateWithLifecycle()
     val streamTelemetry by viewModel.streamTelemetry.collectAsStateWithLifecycle()
     val boundPenDisplayPackages by viewModel.boundPenDisplayPackages.collectAsStateWithLifecycle()
     val activePenDisplayTasks by viewModel.activePenDisplayTasks.collectAsStateWithLifecycle()
+    val batteryUnrestricted by viewModel.batteryUnrestricted.collectAsStateWithLifecycle()
+
+    val cursorMeta by remember(viewModel) {
+        viewModel.cursorSnapshot
+            .map {
+                RootCursorMeta(
+                    activeCursor = it.activeCursor,
+                    mode = it.mode,
+                    isPaused = it.isPaused,
+                    nativePointerHidden = it.nativePointerHidden,
+                    isFromTablet = it.isFromTablet,
+                    nativeCursorApplied = it.nativeCursorApplied,
+                    overlayPermissionGranted = it.overlayPermissionGranted,
+                    accessibilityServiceEnabled = it.accessibilityServiceEnabled
+                )
+            }
+            .distinctUntilChanged()
+    }.collectAsStateWithLifecycle(
+        initialValue = viewModel.cursorSnapshot.value.let {
+            RootCursorMeta(
+                activeCursor = it.activeCursor,
+                mode = it.mode,
+                isPaused = it.isPaused,
+                nativePointerHidden = it.nativePointerHidden,
+                isFromTablet = it.isFromTablet,
+                nativeCursorApplied = it.nativeCursorApplied,
+                overlayPermissionGranted = it.overlayPermissionGranted,
+                accessibilityServiceEnabled = it.accessibilityServiceEnabled
+            )
+        }
+    )
 
     val notifPermissionLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.RequestPermission()
@@ -191,6 +237,8 @@ fun KodaWintabRoot(
         val obs = LifecycleEventObserver { _, event ->
             if (event == Lifecycle.Event.ON_RESUME) {
                 viewModel.refreshOverlayPermission()
+                viewModel.refreshUsbAndDisplays()
+                viewModel.refreshBatteryOptimizationState()
             }
         }
         lifecycleOwner.lifecycle.addObserver(obs)
@@ -200,17 +248,20 @@ fun KodaWintabRoot(
     val nullAndroidPointerIcon = remember(context) {
         runCatching { PointerIcon.getSystemIcon(context, PointerIcon.TYPE_NULL) }.getOrNull()
     }
-    val shouldHideNativeCompose = cursorSnapshot.activeCursor != null &&
-        !cursorSnapshot.isPaused &&
-        cursorSnapshot.mode == CursorRenderMode.SIMULATED &&
-        nullAndroidPointerIcon != null
+    val shouldHideNativeCompose = !cursorMeta.isPaused &&
+        nullAndroidPointerIcon != null &&
+        (cursorMeta.nativePointerHidden ||
+            (cursorMeta.activeCursor != null &&
+                (cursorMeta.mode == CursorRenderMode.SIMULATED ||
+                    cursorMeta.overlayPermissionGranted && (cursorMeta.isFromTablet || !cursorMeta.nativeCursorApplied))))
 
-    // Apply native Android View PointerIcon in Native mode, OR hide native arrow (TYPE_NULL) in Simulated mode
-    LaunchedEffect(cursorSnapshot.mode, cursorSnapshot.activeCursor, cursorSnapshot.isPaused) {
-        val active = cursorSnapshot.activeCursor
+    // Apply native Android View PointerIcon ONLY when native OS hook succeeded without overlay, otherwise force TYPE_NULL (no double cursor)
+    LaunchedEffect(cursorMeta) {
+        val active = cursorMeta.activeCursor
         view.pointerIcon = when {
-            active == null || cursorSnapshot.isPaused -> null
-            cursorSnapshot.mode == CursorRenderMode.NATIVE -> active.pointerIcon
+            active == null || cursorMeta.isPaused -> null
+            shouldHideNativeCompose -> nullAndroidPointerIcon
+            cursorMeta.mode == CursorRenderMode.NATIVE -> active.pointerIcon
             else -> nullAndroidPointerIcon
         }
     }
@@ -274,11 +325,19 @@ fun KodaWintabRoot(
                 ActivationScreen(
                     engineState = engineState,
                     errorPopup = errorPopup,
+                    overlayGranted = cursorMeta.overlayPermissionGranted,
+                    accessibilityEnabled = cursorMeta.accessibilityServiceEnabled,
+                    batteryUnrestricted = batteryUnrestricted,
                     onActivateSingleEngine = { viewModel.activateSingleEngine() },
                     onSilentPoll = { viewModel.silentPollEngineConnection() },
                     onVerifyConnection = { viewModel.verifyEngineConnection(showErrorPopupOnFail = true) },
                     onSelectTransportMode = { viewModel.setAdbTransportMode(it) },
+                    onWifiPortChanged = { viewModel.setWifiPort(it) },
+                    onKeepTerminalOpenChanged = { viewModel.setKeepTerminalOpenMode(it) },
                     onRefreshNetworkIp = { viewModel.refreshLocalNetworkIp() },
+                    onOpenOverlaySettings = { viewModel.openOverlaySettings() },
+                    onOpenAccessibilitySettings = { viewModel.openAccessibilitySettings() },
+                    onOpenBatteryOptimizationSettings = { viewModel.openBatteryOptimizationSettings() },
                     onDismissErrorPopup = { viewModel.dismissErrorPopup() },
                     onActivatedOpenApp = {
                         viewModel.startHubServiceSafely()
@@ -290,6 +349,7 @@ fun KodaWintabRoot(
             }
 
             composable(KodaRoutes.ROUTE_HOME) {
+                val telemetryMesa1 by viewModel.telemetryMesa1.collectAsStateWithLifecycle()
                 HomeScreen(
                     engineState = engineState,
                     telemetry = telemetryMesa1,
@@ -336,23 +396,25 @@ fun KodaWintabRoot(
             composable(KodaRoutes.ROUTE_PRIVILEGES) {
                 PrivilegeStatusScreen(
                     engineState = engineState,
-                    overlayGranted = cursorSnapshot.overlayPermissionGranted,
+                    overlayGranted = cursorMeta.overlayPermissionGranted,
+                    accessibilityEnabled = cursorMeta.accessibilityServiceEnabled,
+                    batteryUnrestricted = batteryUnrestricted,
                     usbDeviceCount = usbDevices.size,
                     onBack = { navController.popBackStack() },
                     onSilentReconnect = {
                         viewModel.silentPollEngineConnection()
                         viewModel.refreshOverlayPermission()
+                        viewModel.refreshBatteryOptimizationState()
                     },
+                    onVerifyPcConnection = { viewModel.verifyEngineConnection(showErrorPopupOnFail = true) },
+                    onSelectTransportMode = { viewModel.setAdbTransportMode(it) },
+                    onWifiPortChanged = { viewModel.setWifiPort(it) },
+                    onKeepTerminalOpenChanged = { viewModel.setKeepTerminalOpenMode(it) },
+                    onRefreshNetworkIp = { viewModel.refreshLocalNetworkIp() },
                     onGrantOverlayViaAdb = { viewModel.grantOverlayViaAdb() },
-                    onOpenOverlaySettings = {
-                        runCatching {
-                            val intent = Intent(
-                                android.provider.Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
-                                android.net.Uri.parse("package:${context.packageName}")
-                            )
-                            context.startActivity(intent)
-                        }
-                    }
+                    onOpenOverlaySettings = { viewModel.openOverlaySettings() },
+                    onOpenAccessibilitySettings = { viewModel.openAccessibilitySettings() },
+                    onOpenBatteryOptimizationSettings = { viewModel.openBatteryOptimizationSettings() }
                 )
             }
 
@@ -361,12 +423,12 @@ fun KodaWintabRoot(
                     selectedSlot = selectedSlot,
                     tabletConfig = tabletConfig,
                     availableProfiles = availableProfiles,
-                    telemetry = telemetryMesa1,
-                    hexFrames = hexFrames,
+                    telemetryFlow = viewModel.telemetryMesa1,
+                    hexFramesFlow = viewModel.hexFrames,
                     displays = displays,
                     installedApps = installedApps,
                     connectedTabletCount = usbDevices.count { it.kind == UsbPeripheralKind.TABLET },
-                    cursorSnapshot = cursorSnapshot,
+                    cursorSnapshotFlow = viewModel.cursorSnapshot,
                     onBack = { navController.popBackStack() },
                     onSelectSlot = { viewModel.selectTabletSlot(it) },
                     onSelectProfile = { viewModel.selectProfile(it) },
@@ -386,11 +448,13 @@ fun KodaWintabRoot(
                     onResetOutputTab = { viewModel.resetOutputTab() },
                     onResetAllTabs = { viewModel.resetAllTabs() },
                     onActivateAutoDpi = { viewModel.activateAutoDpi() },
-                    onOpenCursorHub = { navController.navigate(KodaRoutes.ROUTE_HUB) }
+                    onOpenCursorHub = { navController.navigate(KodaRoutes.ROUTE_HUB) },
+                    onSetCalibrationCursorHidden = { viewModel.setCalibrationCursorSuppressed(it) }
                 )
             }
 
             composable(KodaRoutes.ROUTE_HUB) {
+                val cursorSnapshot by viewModel.cursorSnapshot.collectAsStateWithLifecycle()
                 HubScreen(
                     usbDevices = usbDevices,
                     usbEventLog = usbEventLog,
@@ -414,6 +478,7 @@ fun KodaWintabRoot(
                     onSelectCursorMode = { viewModel.setCursorRenderMode(it) },
                     onChangeCursorScale = { viewModel.setCursorScale(it) },
                     onGrantOverlayViaAdb = { viewModel.grantOverlayViaAdb() },
+                    onOpenAccessibilitySettings = { viewModel.openAccessibilitySettings() },
                     onToggleSimulatedAppClosed = { pkg, label -> viewModel.toggleSimulatedAppClosed(pkg, label) },
                     onDismissCoopBanner = { viewModel.dismissCoopBanner() }
                 )

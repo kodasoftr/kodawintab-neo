@@ -1,8 +1,10 @@
 package com.example
 
+import android.app.Activity
 import android.app.Application
 import android.content.ComponentCallbacks2
 import android.content.res.Configuration
+import android.os.Bundle
 import com.example.display.DisplayTargetManager
 import com.example.display.TargetDisplayInfo
 import com.example.driver.TabletPipeline
@@ -12,6 +14,7 @@ import com.example.hub.CursorOverlayManager
 import com.example.hub.HubManager
 import com.example.koda.engine.KodaEngineClient
 import com.example.pendisplay.PenDisplayEngineManager
+import com.example.service.KodaHubForegroundService
 import com.example.usb.UsbTabletCoordinator
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -33,6 +36,10 @@ data class AppErrorReport(
 class KodaWintabApp : Application() {
 
     val coopMonitorScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+
+    private val startedActivities = HashSet<Int>()
+    @Volatile var isAppInForeground: Boolean = false
+        private set
 
     lateinit var engineClient: KodaEngineClient
         private set
@@ -62,9 +69,37 @@ class KodaWintabApp : Application() {
     override fun onCreate() {
         super.onCreate()
         installCrashGuard()
+        registerActivityLifecycleCallbacks(object : ActivityLifecycleCallbacks {
+            override fun onActivityStarted(activity: Activity) {
+                synchronized(startedActivities) {
+                    startedActivities.add(System.identityHashCode(activity))
+                    isAppInForeground = true
+                }
+                if (::cursorOverlayManager.isInitialized) {
+                    cursorOverlayManager.setOwnAppForeground(true)
+                }
+            }
+            override fun onActivityStopped(activity: Activity) {
+                val nowInForeground = synchronized(startedActivities) {
+                    startedActivities.remove(System.identityHashCode(activity))
+                    val any = startedActivities.isNotEmpty()
+                    isAppInForeground = any
+                    any
+                }
+                if (::cursorOverlayManager.isInitialized) {
+                    cursorOverlayManager.setOwnAppForeground(nowInForeground)
+                }
+            }
+            override fun onActivityCreated(activity: Activity, savedInstanceState: Bundle?) = Unit
+            override fun onActivityResumed(activity: Activity) = Unit
+            override fun onActivityPaused(activity: Activity) = Unit
+            override fun onActivitySaveInstanceState(activity: Activity, outState: Bundle) = Unit
+            override fun onActivityDestroyed(activity: Activity) = Unit
+        })
         engineClient = KodaEngineClient(this)
         profileRepository = TabletProfileRepository(this)
         cursorOverlayManager = CursorOverlayManager(this).apply {
+            setOwnAppForeground(isAppInForeground)
             onNativePointerHideChanged = { hide ->
                 coopMonitorScope.launch(Dispatchers.IO) {
                     runCatching { engineClient.hideNativePointer(hide) }
@@ -113,8 +148,45 @@ class KodaWintabApp : Application() {
                     normX = x / pdState.selectedPreset.widthPx.toFloat(),
                     normY = y / pdState.selectedPreset.heightPx.toFloat(),
                     pressureNorm = tel.lastCurvedPressure,
-                    isTipDown = tel.isTipDown
+                    isTipDown = tel.isTipDown,
+                    tiltX = tel.lastTiltX,
+                    tiltY = tel.lastTiltY,
+                    injectSystemEvent = pipelineMesa1.config.targetDisplayId != pdState.virtualDisplayId
                 )
+            }
+        }
+        usbCoordinator.onTabletProfileConnected = { slot, profile ->
+            val targetDisplayId = if (slot == com.example.driver.TabletSlotId.MESA_2) {
+                pipelineMesa2.config.targetDisplayId
+            } else {
+                pipelineMesa1.config.targetDisplayId
+            }
+            val disp = displayManager.getDisplayOrDefault(targetDisplayId)
+            if (slot == com.example.driver.TabletSlotId.MESA_2) {
+                val updatedCfg = pipelineMesa2.config.copy(profileId = profile.id)
+                pipelineMesa2.updateConfiguration(
+                    newConfig = updatedCfg,
+                    profile = profile,
+                    parser = profileRepository.createParserFor(profile),
+                    displayWidth = disp.widthPx.toFloat(),
+                    displayHeight = disp.heightPx.toFloat(),
+                    displayRotationDeg = disp.rotationDeg,
+                    displayXdpi = disp.xdpi,
+                    displayYdpi = disp.ydpi
+                )
+            } else {
+                val updatedCfg = pipelineMesa1.config.copy(profileId = profile.id)
+                pipelineMesa1.updateConfiguration(
+                    newConfig = updatedCfg,
+                    profile = profile,
+                    parser = profileRepository.createParserFor(profile),
+                    displayWidth = disp.widthPx.toFloat(),
+                    displayHeight = disp.heightPx.toFloat(),
+                    displayRotationDeg = disp.rotationDeg,
+                    displayXdpi = disp.xdpi,
+                    displayYdpi = disp.ydpi
+                )
+                cursorOverlayManager.syncTabletMatrixConfig(updatedCfg, profile, disp)
             }
         }
         usbCoordinator.resolveCursorChannel = { key ->
@@ -154,21 +226,31 @@ class KodaWintabApp : Application() {
                     displayXdpi = disp1.xdpi,
                     displayYdpi = disp1.ydpi
                 )
-                cursorOverlayManager.setTabletRotationConfig(
-                    autoRotateWithScreen = cfg1.autoRotation && cfg1.rotateTabletAxesWithScreen,
-                    manualRotationDeg = cfg1.manualRotationDeg
-                )
                 usbCoordinator.updateMouseDisplayBounds(
                     widthPx = disp1.widthPx.toFloat(),
                     heightPx = disp1.heightPx.toFloat()
                 )
-                cursorOverlayManager.updateDisplayBounds(
-                    disp1.widthPx.toFloat(),
-                    disp1.heightPx.toFloat(),
-                    disp1.rotationDeg
-                )
+                cursorOverlayManager.syncTabletMatrixConfig(cfg1, prof1, disp1)
             }
         }
+
+        // Keep background driver, USB claim, and overlay alive across app switches / launcher restarts
+        if (engineClient.isPermanentlyActivated() && !KodaHubForegroundService.wasUserTerminated(this)) {
+            ensureBackgroundDriverActive()
+        }
+    }
+
+    fun ensureBackgroundDriverActive() {
+        runCatching { usbCoordinator.registerReceiver() }
+        runCatching { pipelineMesa1.start() }
+        runCatching { hubManager.startCoopMonitor(coopMonitorScope) }
+        runCatching { cursorOverlayManager.setPaused(false) }
+        runCatching { cursorOverlayManager.refreshOverlayPermission() }
+        runCatching { startGlobalPointerStream() }
+        if (engineClient.isPermanentlyActivated() && !KodaHubForegroundService.wasUserTerminated(this)) {
+            runCatching { KodaHubForegroundService.start(this) }
+        }
+        runCatching { usbCoordinator.refreshConnectedDevices() }
     }
 
     fun syncDisplayStateEverywhere(disp: TargetDisplayInfo) {
@@ -196,6 +278,7 @@ class KodaWintabApp : Application() {
                 displayXdpi = targetDisp.xdpi,
                 displayYdpi = targetDisp.ydpi
             )
+            cursorOverlayManager.syncTabletMatrixConfig(cfg1, prof, targetDisp)
         }
         val cfg2 = pipelineMesa2.config
         if (cfg2.targetDisplayId == disp.displayId || cfg2.targetDisplayId == 0) {
@@ -236,8 +319,9 @@ class KodaWintabApp : Application() {
                 }
                 reconnectTick = 0
                 val snap = cursorOverlayManager.snapshot.value
+                val hasDirectUsbFeed = usbCoordinator.hasActiveTabletSession() || usbCoordinator.hasActiveMouseSession()
                 val hasAnyCursor = snap.channel1Cursor != null || snap.channel2Cursor != null || snap.activeCursor != null
-                if (hasAnyCursor && !snap.isPaused) {
+                if (!isAppInForeground && !hasDirectUsbFeed && hasAnyCursor && !snap.isPaused) {
                     val sample = engineClient.pollGlobalPointer()
                     if (sample != null) {
                         val disp = displayManager.getDisplayOrDefault(0)
@@ -248,9 +332,9 @@ class KodaWintabApp : Application() {
                             displayRotationDeg = disp.rotationDeg
                         )
                     }
-                    delay(8L)
+                    delay(12L)
                 } else {
-                    delay(60L)
+                    delay(48L)
                 }
             }
         }

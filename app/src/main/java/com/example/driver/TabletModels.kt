@@ -185,6 +185,7 @@ class TabletReport {
     @JvmField var barrelButton1: Boolean = false
     @JvmField var barrelButton2: Boolean = false
     @JvmField var expressKeyMask: Int = 0
+    @JvmField var isExpressKeyFrame: Boolean = false
     @JvmField var timestampNs: Long = 0L
     @JvmField var sequenceId: Long = 0L
 
@@ -201,6 +202,7 @@ class TabletReport {
         barrelButton1 = false
         barrelButton2 = false
         expressKeyMask = 0
+        isExpressKeyFrame = false
     }
 }
 
@@ -236,5 +238,8 @@ data class DriverTelemetry(
     val effectiveRotationDeg: Int = 0,
     val effectiveDpiX: Float = 420f,
     val effectiveDpiY: Float = 420f,
+    val activeWidthMm: Float = 160f,
+    val activeHeightMm: Float = 100f,
+    val pxPerMmX: Float = 16.5f,
     val lastTriggeredShortcut: String = ""
 )

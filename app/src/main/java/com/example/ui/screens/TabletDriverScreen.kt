@@ -58,7 +58,6 @@ import androidx.compose.material3.Tab
 import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
@@ -80,6 +79,7 @@ import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.example.display.TargetDisplayInfo
 import com.example.driver.ActiveAreaRect
 import com.example.driver.DriverTelemetry
@@ -89,11 +89,27 @@ import com.example.driver.TabletConfig
 import com.example.driver.TabletProfileJson
 import com.example.driver.TabletSlotId
 import com.example.hub.CursorOverlaySnapshot
+import com.example.hub.CursorRenderMode
+import com.example.hub.DecodedCursor
 import com.example.hub.InstalledAppEntry
 import com.example.ui.theme.AmberAccent
 import com.example.ui.theme.EmeraldActive
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.map
 import java.util.Locale
 import kotlin.math.hypot
+
+private data class DriverCursorBannerMeta(
+    val activeCursor: DecodedCursor? = null,
+    val mode: CursorRenderMode = CursorRenderMode.SIMULATED
+)
+
+private data class TopBarTelemetryMeta(
+    val activeProfileName: String = "",
+    val effectiveRotationDeg: Int = 0,
+    val effectiveDpiX: Int = 420
+)
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -101,12 +117,12 @@ fun TabletDriverScreen(
     selectedSlot: TabletSlotId,
     tabletConfig: TabletConfig,
     availableProfiles: List<TabletProfileJson>,
-    telemetry: DriverTelemetry,
-    hexFrames: List<HidHexFrame>,
+    telemetryFlow: StateFlow<DriverTelemetry>,
+    hexFramesFlow: StateFlow<List<HidHexFrame>>,
     displays: List<TargetDisplayInfo>,
     installedApps: List<InstalledAppEntry>,
     connectedTabletCount: Int,
-    cursorSnapshot: CursorOverlaySnapshot,
+    cursorSnapshotFlow: StateFlow<CursorOverlaySnapshot>,
     onBack: () -> Unit,
     onSelectSlot: (TabletSlotId) -> Unit,
     onSelectProfile: (String) -> Unit,
@@ -124,37 +140,34 @@ fun TabletDriverScreen(
     onResetOutputTab: () -> Unit = {},
     onResetAllTabs: () -> Unit = {},
     onActivateAutoDpi: () -> Unit,
-    onOpenCursorHub: () -> Unit
+    onOpenCursorHub: () -> Unit,
+    onSetCalibrationCursorHidden: (Boolean) -> Unit = {}
 ) {
     var selectedTab by remember { mutableIntStateOf(0) }
     var showTestTools by remember { mutableStateOf(false) }
     var showFullScreenBlankSheet by remember { mutableStateOf(false) }
     var showFullScreenCalibration by remember { mutableStateOf(false) }
-    var localAimCursor by remember { mutableStateOf<Offset?>(null) }
 
-    val otdTabs = listOf(
-        "Tablet" to Icons.Default.AspectRatio,
-        "Pen" to Icons.Default.Brush,
-        "Bindings" to Icons.Default.Keyboard,
-        "Filters" to Icons.Default.Tune,
-        "Output" to Icons.Default.Monitor
-    )
-    val activeProfile = availableProfiles.firstOrNull { it.id == tabletConfig.profileId }
-
-    LaunchedEffect(
-        telemetry.lastScreenX,
-        telemetry.lastScreenY,
-        telemetry.isPenInRange,
-        telemetry.isTipDown,
-        cursorSnapshot.cursorX,
-        cursorSnapshot.cursorY
-    ) {
-        if (telemetry.isPenInRange || telemetry.isTipDown) {
-            localAimCursor = Offset(telemetry.lastScreenX, telemetry.lastScreenY)
-        } else {
-            localAimCursor = Offset(cursorSnapshot.cursorX, cursorSnapshot.cursorY)
-        }
+    val otdTabs = remember {
+        listOf(
+            "Tablet" to Icons.Default.AspectRatio,
+            "Pen" to Icons.Default.Brush,
+            "Bindings" to Icons.Default.Keyboard,
+            "Filters" to Icons.Default.Tune,
+            "Output" to Icons.Default.Monitor
+        )
     }
+    val activeProfile = availableProfiles.firstOrNull { it.id == tabletConfig.profileId }
+    val cursorBannerMeta by remember(cursorSnapshotFlow) {
+        cursorSnapshotFlow
+            .map { DriverCursorBannerMeta(activeCursor = it.activeCursor, mode = it.mode) }
+            .distinctUntilChanged()
+    }.collectAsStateWithLifecycle(
+        initialValue = DriverCursorBannerMeta(
+            activeCursor = cursorSnapshotFlow.value.activeCursor,
+            mode = cursorSnapshotFlow.value.mode
+        )
+    )
 
     Scaffold(
         topBar = {
@@ -162,10 +175,9 @@ fun TabletDriverScreen(
                 title = {
                     Column {
                         Text("Driver Global 2.0 · Mesa", style = MaterialTheme.typography.titleLarge)
-                        Text(
-                            text = "${activeProfile?.name ?: telemetry.activeProfileName} · ${telemetry.effectiveRotationDeg}° · ${telemetry.effectiveDpiX.toInt()} DPI",
-                            style = MaterialTheme.typography.labelMedium,
-                            color = MaterialTheme.colorScheme.primary
+                        TopBarTelemetrySubtitle(
+                            profileNameOverride = activeProfile?.name,
+                            telemetryFlow = telemetryFlow
                         )
                     }
                 },
@@ -212,16 +224,7 @@ fun TabletDriverScreen(
             modifier = Modifier
                 .fillMaxSize()
                 .padding(innerPadding)
-                .background(MaterialTheme.colorScheme.background)
-                .pointerInput(Unit) {
-                    awaitPointerEventScope {
-                        while (true) {
-                            val ev = awaitPointerEvent()
-                            val ch = ev.changes.firstOrNull() ?: continue
-                            localAimCursor = ch.position
-                        }
-                    }
-                },
+                .background(MaterialTheme.colorScheme.background),
             contentAlignment = Alignment.TopCenter
         ) {
             Column(
@@ -247,7 +250,7 @@ fun TabletDriverScreen(
                             horizontalArrangement = Arrangement.spacedBy(8.dp),
                             modifier = Modifier.weight(1f)
                         ) {
-                            val activeCursor = cursorSnapshot.activeCursor
+                            val activeCursor = cursorBannerMeta.activeCursor
                             if (activeCursor != null) {
                                 Image(
                                     bitmap = activeCursor.bitmap.asImageBitmap(),
@@ -259,7 +262,7 @@ fun TabletDriverScreen(
                                         .padding(2.dp)
                                 )
                                 Text(
-                                    text = "Mira ativa: ${activeCursor.fileName} (${cursorSnapshot.mode.label})",
+                                    text = "Mira ativa: ${activeCursor.fileName} (${cursorBannerMeta.mode.label})",
                                     style = MaterialTheme.typography.labelMedium,
                                     color = EmeraldActive
                                 )
@@ -344,7 +347,7 @@ fun TabletDriverScreen(
                     when (selectedTab) {
                         0 -> TabletAreaAndRotationTab(
                             config = tabletConfig,
-                            telemetry = telemetry,
+                            telemetryFlow = telemetryFlow,
                             profile = activeProfile,
                             displays = displays,
                             onUpdateConfig = onUpdateConfig,
@@ -353,18 +356,18 @@ fun TabletDriverScreen(
                         )
                         1 -> PenPressureTab(
                             config = tabletConfig,
-                            telemetry = telemetry,
+                            telemetryFlow = telemetryFlow,
                             maxPressure = activeProfile?.maxPressure ?: 8191,
                             onUpdateConfig = onUpdateConfig,
                             onApplyPreset = onApplyPressurePreset,
                             onUpdatePressurePoint = onUpdatePressurePoint,
                             onResetTab = onResetPenTab
                         )
-                        2 -> BindingsTab(
+                        2 -> BindingsTabWrapper(
                             config = tabletConfig,
                             profileName = activeProfile?.name ?: "Mesa Selecionada",
                             expressCount = activeProfile?.expressKeysCount ?: 10,
-                            telemetry = telemetry,
+                            telemetryFlow = telemetryFlow,
                             onUpdateConfig = onUpdateConfig,
                             onResetTab = onResetBindingsTab
                         )
@@ -373,10 +376,10 @@ fun TabletDriverScreen(
                             onUpdateConfig = onUpdateConfig,
                             onResetTab = onResetFiltersTab
                         )
-                        4 -> OutputTab(
+                        4 -> OutputTabWrapper(
                             config = tabletConfig,
                             profile = activeProfile,
-                            telemetry = telemetry,
+                            telemetryFlow = telemetryFlow,
                             displays = displays,
                             installedApps = installedApps,
                             onUpdateConfig = onUpdateConfig,
@@ -416,22 +419,13 @@ fun TabletDriverScreen(
                     Spacer(Modifier.height(72.dp))
                 }
             }
-
-            if (cursorSnapshot.activeCursor != null && !cursorSnapshot.overlayPermissionGranted) {
-                localAimCursor?.let { pt ->
-                    InAppActiveCursorSprite(
-                        cursorSnapshot = cursorSnapshot,
-                        position = pt
-                    )
-                }
-            }
         }
     }
 
     if (showTestTools) {
         TabletTestToolsSheet(
-            telemetry = telemetry,
-            hexFrames = hexFrames,
+            telemetryFlow = telemetryFlow,
+            hexFramesFlow = hexFramesFlow,
             onFeedTestPacket = onFeedTestPacket,
             onOpenFullScreenBlankSheet = {
                 showTestTools = false
@@ -447,8 +441,8 @@ fun TabletDriverScreen(
 
     if (showFullScreenBlankSheet) {
         FullScreenBlankSheetStrokeDialog(
-            telemetry = telemetry,
-            cursorSnapshot = cursorSnapshot,
+            telemetryFlow = telemetryFlow,
+            cursorSnapshotFlow = cursorSnapshotFlow,
             onFeedTestPacket = onFeedTestPacket,
             onDismiss = { showFullScreenBlankSheet = false }
         )
@@ -456,8 +450,10 @@ fun TabletDriverScreen(
 
     if (showFullScreenCalibration) {
         FullScreenCalibrationDialog(
-            telemetry = telemetry,
-            cursorSnapshot = cursorSnapshot,
+            telemetryFlow = telemetryFlow,
+            maxRawX = activeProfile?.maxX ?: 32767,
+            maxRawY = activeProfile?.maxY ?: 32767,
+            onSetCalibrationCursorHidden = onSetCalibrationCursorHidden,
             onFeedTestPacket = onFeedTestPacket,
             onApplyCalibration = onApplyCalibration,
             onResetFactoryCalibration = onResetFactoryCalibration,
@@ -467,9 +463,97 @@ fun TabletDriverScreen(
 }
 
 @Composable
+private fun TopBarTelemetrySubtitle(
+    profileNameOverride: String?,
+    telemetryFlow: StateFlow<DriverTelemetry>
+) {
+    val meta by remember(telemetryFlow) {
+        telemetryFlow
+            .map {
+                TopBarTelemetryMeta(
+                    activeProfileName = it.activeProfileName,
+                    effectiveRotationDeg = it.effectiveRotationDeg,
+                    effectiveDpiX = it.effectiveDpiX.toInt()
+                )
+            }
+            .distinctUntilChanged()
+    }.collectAsStateWithLifecycle(
+        initialValue = TopBarTelemetryMeta(
+            activeProfileName = telemetryFlow.value.activeProfileName,
+            effectiveRotationDeg = telemetryFlow.value.effectiveRotationDeg,
+            effectiveDpiX = telemetryFlow.value.effectiveDpiX.toInt()
+        )
+    )
+    Text(
+        text = "${profileNameOverride ?: meta.activeProfileName} · ${meta.effectiveRotationDeg}° · ${meta.effectiveDpiX} DPI",
+        style = MaterialTheme.typography.labelMedium,
+        color = MaterialTheme.colorScheme.primary
+    )
+}
+
+@Composable
+private fun BindingsTabWrapper(
+    config: TabletConfig,
+    profileName: String,
+    expressCount: Int,
+    telemetryFlow: StateFlow<DriverTelemetry>,
+    onUpdateConfig: ((TabletConfig) -> TabletConfig) -> Unit,
+    onResetTab: () -> Unit
+) {
+    val lastShortcut by remember(telemetryFlow) {
+        telemetryFlow.map { it.lastTriggeredShortcut }.distinctUntilChanged()
+    }.collectAsStateWithLifecycle(initialValue = telemetryFlow.value.lastTriggeredShortcut)
+    BindingsTab(
+        config = config,
+        profileName = profileName,
+        expressCount = expressCount,
+        telemetry = remember(lastShortcut) { DriverTelemetry(lastTriggeredShortcut = lastShortcut) },
+        onUpdateConfig = onUpdateConfig,
+        onResetTab = onResetTab
+    )
+}
+
+@Composable
+private fun OutputTabWrapper(
+    config: TabletConfig,
+    profile: TabletProfileJson?,
+    telemetryFlow: StateFlow<DriverTelemetry>,
+    displays: List<TargetDisplayInfo>,
+    installedApps: List<InstalledAppEntry>,
+    onUpdateConfig: ((TabletConfig) -> TabletConfig) -> Unit,
+    onActivateAutoDpi: () -> Unit,
+    onResetTab: () -> Unit
+) {
+    val staticMetrics by remember(telemetryFlow) {
+        telemetryFlow
+            .map {
+                DriverTelemetry(
+                    effectiveDpiX = it.effectiveDpiX,
+                    effectiveDpiY = it.effectiveDpiY,
+                    pxPerMmX = it.pxPerMmX,
+                    activeWidthMm = it.activeWidthMm,
+                    activeHeightMm = it.activeHeightMm,
+                    maxNativePressure = it.maxNativePressure
+                )
+            }
+            .distinctUntilChanged()
+    }.collectAsStateWithLifecycle(initialValue = telemetryFlow.value)
+    OutputTab(
+        config = config,
+        profile = profile,
+        telemetry = staticMetrics,
+        displays = displays,
+        installedApps = installedApps,
+        onUpdateConfig = onUpdateConfig,
+        onActivateAutoDpi = onActivateAutoDpi,
+        onResetTab = onResetTab
+    )
+}
+
+@Composable
 private fun TabletAreaAndRotationTab(
     config: TabletConfig,
-    telemetry: DriverTelemetry,
+    telemetryFlow: StateFlow<DriverTelemetry>,
     profile: TabletProfileJson?,
     displays: List<TargetDisplayInfo>,
     onUpdateConfig: ((TabletConfig) -> TabletConfig) -> Unit,
@@ -482,6 +566,9 @@ private fun TabletAreaAndRotationTab(
     } else {
         "Retrato (${activeDisplay?.rotationDeg ?: 0}°)"
     }
+    val effectiveRotationDeg by remember(telemetryFlow) {
+        telemetryFlow.map { it.effectiveRotationDeg }.distinctUntilChanged()
+    }.collectAsStateWithLifecycle(initialValue = telemetryFlow.value.effectiveRotationDeg)
 
     Card(
         colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
@@ -506,7 +593,7 @@ private fun TabletAreaAndRotationTab(
                     }
                 }
                 Text(
-                    text = "$orientationLabel · Efetivo: ${telemetry.effectiveRotationDeg}°" +
+                    text = "$orientationLabel · Efetivo: ${effectiveRotationDeg}°" +
                         (if (config.invertX) " · InvX" else "") +
                         (if (config.invertY) " · InvY" else ""),
                     style = MaterialTheme.typography.labelMedium,
@@ -592,15 +679,11 @@ private fun TabletAreaAndRotationTab(
                     val ox = if (config.invertX) left + w - 12f else left + 12f
                     val oy = if (config.invertY) top + h - 12f else top + 12f
                     drawCircle(color = secondary, radius = 7f, center = Offset(ox, oy))
-
-                    // Live pen position dot on tablet surface
-                    if ((telemetry.isPenInRange || telemetry.isTipDown) && profile != null && profile.maxX > 0 && profile.maxY > 0) {
-                        val px = (telemetry.lastRawX.toFloat() / profile.maxX).coerceIn(0f, 1f) * size.width
-                        val py = (telemetry.lastRawY.toFloat() / profile.maxY).coerceIn(0f, 1f) * size.height
-                        drawCircle(color = EmeraldActive.copy(alpha = 0.30f), radius = 14f, center = Offset(px, py))
-                        drawCircle(color = EmeraldActive, radius = 6f, center = Offset(px, py))
-                    }
                 }
+                TabletAreaLivePenDotCanvas(
+                    profile = profile,
+                    telemetryFlow = telemetryFlow
+                )
                 Surface(
                     color = Color(0xBA0E1222),
                     shape = MaterialTheme.shapes.small,
@@ -693,7 +776,7 @@ private fun TabletAreaAndRotationTab(
                     FilterChip(
                         selected = !config.rotateTabletAxesWithScreen,
                         onClick = { onUpdateConfig { it.copy(rotateTabletAxesWithScreen = false) } },
-                        label = { Text("Mesa na Mesa (Adaptar Tela)") },
+                        label = { Text("Mesa Fixa (Sem Inverter Paisagem)") },
                         modifier = Modifier.weight(1f)
                     )
                     FilterChip(
@@ -737,6 +820,19 @@ private fun TabletAreaAndRotationTab(
                     Spacer(Modifier.width(4.dp))
                     Text("+90°")
                 }
+            }
+            OutlinedButton(
+                onClick = {
+                    onUpdateConfig {
+                        it.copy(manualRotationDeg = (it.manualRotationDeg + 180) % 360)
+                    }
+                },
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(48.dp)
+                    .testTag("manual_flip_180_button")
+            ) {
+                Text("Inverter 180° (Corrigir Cabo / Cabeça p/ Baixo)")
             }
 
             Row(
@@ -857,9 +953,31 @@ private fun matchesCurvePreset(current: List<PressureControlPoint>, preset: List
 }
 
 @Composable
+private fun TabletAreaLivePenDotCanvas(
+    profile: TabletProfileJson?,
+    telemetryFlow: StateFlow<DriverTelemetry>
+) {
+    val penPos by remember(telemetryFlow) {
+        telemetryFlow
+            .map { Triple(it.isPenInRange || it.isTipDown, it.lastRawX, it.lastRawY) }
+            .distinctUntilChanged()
+    }.collectAsStateWithLifecycle(initialValue = Triple(false, 0, 0))
+
+    Canvas(modifier = Modifier.fillMaxSize()) {
+        val (visible, rawX, rawY) = penPos
+        if (visible && profile != null && profile.maxX > 0 && profile.maxY > 0) {
+            val px = (rawX.toFloat() / profile.maxX).coerceIn(0f, 1f) * size.width
+            val py = (rawY.toFloat() / profile.maxY).coerceIn(0f, 1f) * size.height
+            drawCircle(color = EmeraldActive.copy(alpha = 0.30f), radius = 14f, center = Offset(px, py))
+            drawCircle(color = EmeraldActive, radius = 6f, center = Offset(px, py))
+        }
+    }
+}
+
+@Composable
 private fun PenPressureTab(
     config: TabletConfig,
-    telemetry: DriverTelemetry,
+    telemetryFlow: StateFlow<DriverTelemetry>,
     maxPressure: Int,
     onUpdateConfig: ((TabletConfig) -> TabletConfig) -> Unit,
     onApplyPreset: (List<PressureControlPoint>, String) -> Unit,
@@ -871,6 +989,16 @@ private fun PenPressureTab(
     val primary = MaterialTheme.colorScheme.primary
     val secondary = MaterialTheme.colorScheme.secondary
     val outline = MaterialTheme.colorScheme.outline
+    val dashEffect = remember { PathEffect.dashPathEffect(floatArrayOf(12f, 10f)) }
+
+    val sortedPts = remember(config.pressureCurve) { config.pressureCurve.sortedBy { it.inputNorm } }
+    val precomputedSplineY = remember(sortedPts) {
+        if (sortedPts.size >= 2) {
+            FloatArray(65) { s -> evalSplinePreview(sortedPts, s / 64f) }
+        } else {
+            FloatArray(0)
+        }
+    }
 
     val linearPreset = remember {
         listOf(
@@ -923,11 +1051,7 @@ private fun PenPressureTab(
             ) {
                 Column(modifier = Modifier.weight(1f)) {
                     Text("Gráfico de Curva de Pressão (OTD)", style = MaterialTheme.typography.titleMedium)
-                    Text(
-                        text = "${maxPressure + 1} níveis nativos · Pressão ao vivo: ${(telemetry.lastCurvedPressure * 100f).toInt()}%",
-                        style = MaterialTheme.typography.bodyMedium,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
+                    PenPressureLiveSubtitle(maxPressure = maxPressure, telemetryFlow = telemetryFlow)
                 }
                 Icon(Icons.Default.Brush, contentDescription = null, tint = MaterialTheme.colorScheme.primary)
             }
@@ -1012,17 +1136,15 @@ private fun PenPressureTab(
                         start = Offset(0f, size.height),
                         end = Offset(size.width, 0f),
                         strokeWidth = 2f,
-                        pathEffect = PathEffect.dashPathEffect(floatArrayOf(12f, 10f))
+                        pathEffect = dashEffect
                     )
 
-                    val pts = config.pressureCurve.sortedBy { it.inputNorm }
-                    if (pts.size >= 2) {
+                    if (sortedPts.size >= 2 && precomputedSplineY.size == 65) {
                         val strokePath = Path()
                         val fillPath = Path()
-                        val samples = 64
-                        for (s in 0..samples) {
-                            val xNorm = s / samples.toFloat()
-                            val yNorm = evalSplinePreview(pts, xNorm)
+                        for (s in 0..64) {
+                            val xNorm = s / 64f
+                            val yNorm = precomputedSplineY[s]
                             val px = xNorm * size.width
                             val py = (1f - yNorm) * size.height
                             if (s == 0) {
@@ -1045,7 +1167,7 @@ private fun PenPressureTab(
                         )
                         drawPath(path = strokePath, color = primary, style = Stroke(width = 6f))
 
-                        pts.forEachIndexed { idx, p ->
+                        sortedPts.forEachIndexed { idx, p ->
                             val x = p.inputNorm * size.width
                             val y = (1f - p.outputNorm) * size.height
                             val isDragged = idx == activeDragIndex
@@ -1066,17 +1188,8 @@ private fun PenPressureTab(
                             )
                         }
                     }
-
-                    val rawNorm = if (telemetry.maxNativePressure > 0) {
-                        (telemetry.lastRawPressure.toFloat() / telemetry.maxNativePressure).coerceIn(0f, 1f)
-                    } else 0f
-                    if (rawNorm > 0f) {
-                        val lx = rawNorm * size.width
-                        val ly = (1f - telemetry.lastCurvedPressure.coerceIn(0f, 1f)) * size.height
-                        drawCircle(color = EmeraldActive.copy(alpha = 0.25f), radius = 24f, center = Offset(lx, ly))
-                        drawCircle(color = EmeraldActive, radius = 9f, center = Offset(lx, ly))
-                    }
                 }
+                PenPressureLiveDotCanvas(telemetryFlow = telemetryFlow)
 
                 // Y-axis subtle tick labels
                 Column(
@@ -1162,4 +1275,45 @@ private fun evalSplinePreview(pts: List<PressureControlPoint>, x: Float): Float 
             (-p0.outputNorm + 3f * p1.outputNorm - 3f * p2.outputNorm + p3.outputNorm) * t3
         )
     return y.coerceIn(0f, 1f)
+}
+
+@Composable
+private fun PenPressureLiveSubtitle(
+    maxPressure: Int,
+    telemetryFlow: StateFlow<DriverTelemetry>
+) {
+    val pct by remember(telemetryFlow) {
+        telemetryFlow.map { (it.lastCurvedPressure * 100f).toInt() }.distinctUntilChanged()
+    }.collectAsStateWithLifecycle(initialValue = (telemetryFlow.value.lastCurvedPressure * 100f).toInt())
+    Text(
+        text = "${maxPressure + 1} níveis nativos · Pressão ao vivo: $pct%",
+        style = MaterialTheme.typography.bodyMedium,
+        color = MaterialTheme.colorScheme.onSurfaceVariant
+    )
+}
+
+@Composable
+private fun PenPressureLiveDotCanvas(
+    telemetryFlow: StateFlow<DriverTelemetry>
+) {
+    val livePressure by remember(telemetryFlow) {
+        telemetryFlow
+            .map {
+                val rawNorm = if (it.maxNativePressure > 0) {
+                    (it.lastRawPressure.toFloat() / it.maxNativePressure).coerceIn(0f, 1f)
+                } else 0f
+                rawNorm to it.lastCurvedPressure.coerceIn(0f, 1f)
+            }
+            .distinctUntilChanged()
+    }.collectAsStateWithLifecycle(initialValue = 0f to 0f)
+
+    Canvas(modifier = Modifier.fillMaxSize()) {
+        val (rawNorm, curved) = livePressure
+        if (rawNorm > 0f) {
+            val lx = rawNorm * size.width
+            val ly = (1f - curved) * size.height
+            drawCircle(color = EmeraldActive.copy(alpha = 0.25f), radius = 24f, center = Offset(lx, ly))
+            drawCircle(color = EmeraldActive, radius = 9f, center = Offset(lx, ly))
+        }
+    }
 }

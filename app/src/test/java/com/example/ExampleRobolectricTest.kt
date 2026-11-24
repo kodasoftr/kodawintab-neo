@@ -453,4 +453,138 @@ class ExampleRobolectricTest {
         assertTrue(app.penDisplayManager.state.value.isPenDisplayConnected)
         app.penDisplayManager.stopPenDisplaySession()
     }
+
+    @Test
+    fun `activation screen exposes pc adb controls when expanded alongside standalone activation`() {
+        composeTestRule.waitForIdle()
+        composeTestRule.onNodeWithTag("pc_activation_toggle_button").performScrollTo().performClick()
+        composeTestRule.waitForIdle()
+        composeTestRule.onNodeWithTag("pc_transport_usb_chip").performScrollTo().assertIsDisplayed()
+        composeTestRule.onNodeWithTag("pc_transport_wifi_chip").performScrollTo().assertIsDisplayed()
+        composeTestRule.onNodeWithTag("verify_connection_button").performScrollTo().assertIsDisplayed()
+    }
+
+    @Test
+    fun `cursor overlay synced matrix transforms global stylus coordinates with active area calibration`() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val overlay = com.example.hub.CursorOverlayManager(context)
+        val bmp = android.graphics.Bitmap.createBitmap(16, 16, android.graphics.Bitmap.Config.ARGB_8888)
+        overlay.setChannelCursor(1, com.example.hub.DecodedCursor("stylus.cur", bmp, 0f, 0f, null, "CUR"))
+
+        val profile = TabletProfileRepository(context).getProfileById("ugee_s640")
+        val cfg = com.example.driver.TabletConfig(
+            activeArea = com.example.driver.ActiveAreaRect(0.25f, 0.25f, 0.5f, 0.5f),
+            dpiMode = com.example.driver.DpiNormalizationMode.OFF,
+            lockAspectRatio = false,
+            invertY = true
+        )
+        val disp = com.example.display.TargetDisplayInfo(
+            displayId = 0,
+            name = "Main",
+            modeLabel = "Principal",
+            widthPx = 1000,
+            heightPx = 2000,
+            rotationDeg = 0,
+            xdpi = 440f,
+            ydpi = 440f
+        )
+        overlay.syncTabletMatrixConfig(cfg, profile, disp)
+
+        // Stylus at physical tablet corner (0.25, 0.25) -> with 50% centered activeArea and invertY=true,
+        // normalized local u=0.0, v=1-0.0=1.0 -> screen (0f, 2000f)
+        overlay.applyGlobalPointerSample(
+            com.example.koda.engine.GlobalPointerSample(
+                seq = 500L,
+                hasAbs = true,
+                absXNorm = 0.25f,
+                absYNorm = 0.25f,
+                deltaX = 0f,
+                deltaY = 0f,
+                pressureNorm = 0.5f,
+                isStylus = true,
+                isVisible = true
+            )
+        )
+        assertEquals(0f, overlay.snapshot.value.cursorX, 1.5f)
+        assertEquals(2000f, overlay.snapshot.value.cursorY, 1.5f)
+    }
+
+    @Test
+    fun `cursor overlay always retains built-in default cursor when channel 1 is cleared`() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val overlay = com.example.hub.CursorOverlayManager(context)
+        val builtIn = overlay.snapshot.value.channel1Cursor
+        assertNotNull(builtIn)
+        assertEquals("Padrão Koda (Seta)", builtIn?.fileName)
+        assertEquals("KODA", builtIn?.sourceFormat)
+
+        // Setting a custom cursor replaces Channel 1; clearing restores crisp built-in cursor (never blank)
+        val customBmp = android.graphics.Bitmap.createBitmap(16, 16, android.graphics.Bitmap.Config.ARGB_8888)
+        overlay.setChannelCursor(1, com.example.hub.DecodedCursor("custom.cur", customBmp, 3f, 3f, null, "CUR"))
+        assertEquals("custom.cur", overlay.snapshot.value.channel1Cursor?.fileName)
+
+        overlay.setChannelCursor(1, null)
+        assertNotNull(overlay.snapshot.value.channel1Cursor)
+        assertEquals("Padrão Koda (Seta)", overlay.snapshot.value.channel1Cursor?.fileName)
+        assertTrue(overlay.snapshot.value.isVisible)
+    }
+
+    @Test
+    fun `foreground service onTaskRemoved keeps driver alive without marking user terminated`() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        KodaHubForegroundService.setUserTerminatedFlag(context, false)
+        val controller = Robolectric.buildService(KodaHubForegroundService::class.java).create()
+        controller.startCommand(0, 1)
+
+        controller.get().onTaskRemoved(Intent(context, MainActivity::class.java))
+        org.junit.Assert.assertFalse(KodaHubForegroundService.wasUserTerminated(context))
+    }
+
+    @Test
+    fun `calibration dialog suppresses overlay cursor cleanly and restores on exit`() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val overlay = com.example.hub.CursorOverlayManager(context)
+        org.junit.Assert.assertFalse(overlay.isCalibrationSuppressed())
+
+        overlay.setOwnAppForeground(true)
+        overlay.setCalibrationSuppressed(true)
+        assertTrue(overlay.isCalibrationSuppressed())
+        // Built-in cursor snapshot contract remains intact while floating window is suppressed
+        assertNotNull(overlay.snapshot.value.channel1Cursor)
+
+        overlay.setCalibrationSuppressed(false)
+        org.junit.Assert.assertFalse(overlay.isCalibrationSuppressed())
+
+        // CUJ check inside full calibration dialog
+        composeTestRule.waitForIdle()
+        composeTestRule.onNodeWithTag("single_activate_engine_button").performScrollTo().performClick()
+        composeTestRule.waitUntil(timeoutMillis = 6_000L) {
+            composeTestRule.onAllNodes(hasTestTag("home_mesa_button"))
+                .fetchSemanticsNodes().isNotEmpty() ||
+                composeTestRule.onAllNodes(hasTestTag("activated_open_app_button"))
+                    .fetchSemanticsNodes().isNotEmpty()
+        }
+        if (composeTestRule.onAllNodes(hasTestTag("home_mesa_button")).fetchSemanticsNodes().isEmpty()) {
+            composeTestRule.onNodeWithTag("activated_open_app_button").performClick()
+            composeTestRule.waitUntil(timeoutMillis = 5_000L) {
+                composeTestRule.onAllNodes(hasTestTag("home_mesa_button"))
+                    .fetchSemanticsNodes().isNotEmpty()
+            }
+        }
+        composeTestRule.waitForIdle()
+        composeTestRule.onNodeWithTag("home_mesa_button").performScrollTo().performClick()
+        composeTestRule.waitForIdle()
+
+        val app = context.applicationContext as KodaWintabApp
+        composeTestRule.onNodeWithTag("open_fullscreen_calibration_button").performScrollTo().performClick()
+        composeTestRule.waitForIdle()
+        assertTrue(app.cursorOverlayManager.isCalibrationSuppressed())
+
+        composeTestRule.onNodeWithTag("calibration_back_button").performClick()
+        composeTestRule.waitForIdle()
+        org.junit.Assert.assertFalse(app.cursorOverlayManager.isCalibrationSuppressed())
+    }
 }
+
+
+

@@ -12,7 +12,6 @@ import androidx.compose.animation.scaleIn
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
-import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -30,18 +29,26 @@ import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.AccessibilityNew
 import androidx.compose.material.icons.filled.Apps
 import androidx.compose.material.icons.filled.Bolt
 import androidx.compose.material.icons.filled.CheckCircle
+import androidx.compose.material.icons.filled.Computer
 import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.Draw
 import androidx.compose.material.icons.filled.ErrorOutline
+import androidx.compose.material.icons.filled.ExpandLess
+import androidx.compose.material.icons.filled.ExpandMore
+import androidx.compose.material.icons.filled.Layers
 import androidx.compose.material.icons.filled.Monitor
+import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Speed
 import androidx.compose.material.icons.filled.Terminal
+import androidx.compose.material.icons.filled.Usb
 import androidx.compose.material.icons.filled.VerifiedUser
 import androidx.compose.material.icons.filled.Wifi
 import androidx.compose.material3.AlertDialog
@@ -50,13 +57,16 @@ import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.FilledTonalButton
+import androidx.compose.material3.FilterChip
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
-import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -75,12 +85,14 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import com.example.AppErrorReport
 import com.example.R
 import com.example.koda.engine.AdbTransportMode
 import com.example.koda.engine.KodaEngineState
+import com.example.ui.theme.AmberAccent
 import com.example.ui.theme.CoralError
 import com.example.ui.theme.ElectricCyan
 import com.example.ui.theme.EmeraldActive
@@ -100,13 +112,22 @@ fun ActivationScreen(
     onRefreshNetworkIp: () -> Unit,
     onDismissErrorPopup: () -> Unit,
     onActivatedOpenApp: () -> Unit,
-    modifier: Modifier = Modifier
+    modifier: Modifier = Modifier,
+    overlayGranted: Boolean = false,
+    accessibilityEnabled: Boolean = false,
+    batteryUnrestricted: Boolean = false,
+    onWifiPortChanged: (String) -> Unit = {},
+    onKeepTerminalOpenChanged: (Boolean) -> Unit = {},
+    onOpenOverlaySettings: () -> Unit = {},
+    onOpenAccessibilitySettings: () -> Unit = {},
+    onOpenBatteryOptimizationSettings: () -> Unit = {}
 ) {
     val context = LocalContext.current
     var isBootingCore by remember { mutableStateOf(false) }
     var bootStage by remember { mutableIntStateOf(0) }
-    var showOptionalWirelessSheet by remember { mutableStateOf(false) }
+    var showPcActivationPanel by remember { mutableStateOf(false) }
     var copiedCommand by remember { mutableStateOf(false) }
+    var copiedConnect by remember { mutableStateOf(false) }
 
     val isActivated = engineState.coreEngineActive || engineState.permanentlyActivated || engineState.isActive
 
@@ -194,13 +215,17 @@ fun ActivationScreen(
                     }
 
                     Text(
-                        text = "Koda Core Engine Ativa!",
+                        text = if (engineState.isActive) "Koda Engine + Shell Ativos!" else "Koda Core Engine Ativa!",
                         style = MaterialTheme.typography.displaySmall,
                         color = Color.White,
                         textAlign = TextAlign.Center
                     )
                     Text(
-                        text = "Ativação única concluída diretamente no aparelho.\nPen Display, Kodasoftr Desktop, Stream MediaCodec e WinTab 8192 liberados sem PC e sem Modo Desenvolvedor.",
+                        text = if (engineState.isActive) {
+                            "Servidor Shell UID ${engineState.serverUid} e Driver Autônomo prontos.\nInjeção global de pressão, remoção de cursor duplo e Pen Display ativos!"
+                        } else {
+                            "Ativação concluída diretamente no aparelho.\nDriver OTG, Cursor Global .cur/.ani/.png e Pen Display liberados sem PC e sem Modo Desenvolvedor."
+                        },
                         style = MaterialTheme.typography.bodyLarge,
                         color = Color.White.copy(alpha = 0.92f),
                         textAlign = TextAlign.Center
@@ -237,7 +262,7 @@ fun ActivationScreen(
         } else {
             Column(
                 modifier = Modifier
-                    .widthIn(max = 620.dp)
+                    .widthIn(max = 640.dp)
                     .fillMaxSize()
                     .statusBarsPadding()
                     .navigationBarsPadding()
@@ -245,8 +270,8 @@ fun ActivationScreen(
                     .padding(horizontal = 20.dp, vertical = 18.dp),
                 verticalArrangement = Arrangement.SpaceBetween
             ) {
-                Column(verticalArrangement = Arrangement.spacedBy(16.dp)) {
-                    // Header Brand & Zero-PC Badge
+                Column(verticalArrangement = Arrangement.spacedBy(14.dp)) {
+                    // Header Brand & Badge
                     Row(
                         modifier = Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.SpaceBetween,
@@ -272,7 +297,7 @@ fun ActivationScreen(
                                     color = Color.White
                                 )
                                 Text(
-                                    text = "Ativação Única · Engine Própria",
+                                    text = "Engine Autônoma · Sem PC ou Via PC",
                                     style = MaterialTheme.typography.bodyMedium,
                                     color = ElectricCyan
                                 )
@@ -281,80 +306,152 @@ fun ActivationScreen(
 
                         Surface(
                             shape = CircleShape,
-                            color = ElectricCyan.copy(alpha = 0.14f),
-                            modifier = Modifier.border(1.dp, ElectricCyan.copy(alpha = 0.5f), CircleShape)
+                            color = EmeraldActive.copy(alpha = 0.16f),
+                            modifier = Modifier.border(1.dp, EmeraldActive.copy(alpha = 0.55f), CircleShape)
                         ) {
                             Text(
-                                text = "SEM PC · ZERO ADB",
+                                text = "SEM PC · POWER",
                                 style = MaterialTheme.typography.labelSmall,
-                                color = ElectricCyan,
+                                color = EmeraldActive,
                                 fontWeight = FontWeight.Bold,
                                 modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp)
                             )
                         }
                     }
 
-                    // Hero Engine Card
+                    // Card 1: Autonomous Engine (Zero PC)
                     Card(
                         colors = CardDefaults.cardColors(
-                            containerColor = Color(0xFF121426).copy(alpha = 0.92f)
+                            containerColor = Color(0xFF121426).copy(alpha = 0.94f)
                         ),
                         shape = MaterialTheme.shapes.extraLarge,
                         modifier = Modifier
                             .fillMaxWidth()
                             .border(
                                 1.5.dp,
-                                Brush.linearGradient(listOf(WintabViolet.copy(alpha = 0.7f), ElectricCyan.copy(alpha = 0.7f))),
+                                Brush.linearGradient(listOf(WintabViolet.copy(alpha = 0.75f), ElectricCyan.copy(alpha = 0.75f))),
                                 MaterialTheme.shapes.extraLarge
                             )
                     ) {
                         Column(
                             modifier = Modifier.padding(20.dp),
-                            verticalArrangement = Arrangement.spacedBy(14.dp)
+                            verticalArrangement = Arrangement.spacedBy(12.dp)
                         ) {
                             Text(
-                                text = "Motor Principal Autônomo",
+                                text = "Motor Principal Autônomo (Sem PC)",
                                 style = MaterialTheme.typography.headlineSmall,
                                 color = Color.White
                             )
                             Text(
-                                text = "Ative uma única vez no próprio aparelho para liberar o driver USB OTG, Display Virtual Kodasoftr para Pen Display, codificador GPU MediaCodec e caneta WinTab 8192 níveis — sem cabo de PC e sem Modo Desenvolvedor.",
+                                text = "Funciona sozinho sem conectar no PC: assume mesa/mouse USB OTG (force=true), desenha cursor .cur/.ani/.png único por cima de todo o Android e habilita cliques/arrastar globais.",
                                 style = MaterialTheme.typography.bodyMedium,
-                                color = Color.White.copy(alpha = 0.84f)
+                                color = Color.White.copy(alpha = 0.85f)
                             )
+
+                            // Fast Standalone Permission Boosters (Accessibility + Overlay)
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.spacedBy(8.dp)
+                            ) {
+                                OutlinedButton(
+                                    onClick = onOpenOverlaySettings,
+                                    modifier = Modifier
+                                        .weight(1f)
+                                        .height(48.dp)
+                                        .testTag("activation_overlay_button")
+                                ) {
+                                    Icon(
+                                        imageVector = if (overlayGranted) Icons.Default.CheckCircle else Icons.Default.Layers,
+                                        contentDescription = null,
+                                        tint = if (overlayGranted) EmeraldActive else AmberAccent,
+                                        modifier = Modifier.size(16.dp)
+                                    )
+                                    Spacer(Modifier.width(6.dp))
+                                    Text(
+                                        text = if (overlayGranted) "Overlay OK" else "Sobrepor Apps",
+                                        maxLines = 1,
+                                        color = if (overlayGranted) EmeraldActive else Color.White
+                                    )
+                                }
+                                OutlinedButton(
+                                    onClick = onOpenAccessibilitySettings,
+                                    modifier = Modifier
+                                        .weight(1f)
+                                        .height(48.dp)
+                                        .testTag("activation_accessibility_button")
+                                ) {
+                                    Icon(
+                                        imageVector = if (accessibilityEnabled) Icons.Default.CheckCircle else Icons.Default.AccessibilityNew,
+                                        contentDescription = null,
+                                        tint = if (accessibilityEnabled) EmeraldActive else ElectricCyan,
+                                        modifier = Modifier.size(16.dp)
+                                    )
+                                    Spacer(Modifier.width(6.dp))
+                                    Text(
+                                        text = if (accessibilityEnabled) "Cursor Global OK" else "Cursor Sem PC",
+                                        maxLines = 1,
+                                        color = if (accessibilityEnabled) EmeraldActive else Color.White
+                                    )
+                                }
+                            }
+
+                            OutlinedButton(
+                                onClick = onOpenBatteryOptimizationSettings,
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .height(48.dp)
+                                    .testTag("activation_battery_button")
+                            ) {
+                                Icon(
+                                    imageVector = if (batteryUnrestricted) Icons.Default.CheckCircle else Icons.Default.Bolt,
+                                    contentDescription = null,
+                                    tint = if (batteryUnrestricted) EmeraldActive else AmberAccent,
+                                    modifier = Modifier.size(16.dp)
+                                )
+                                Spacer(Modifier.width(6.dp))
+                                Text(
+                                    text = if (batteryUnrestricted) {
+                                        "Segundo Plano Sem Cortes (OK)"
+                                    } else {
+                                        "Liberar 2º Plano (Não Matar Driver ao Abrir Outro App)"
+                                    },
+                                    maxLines = 1,
+                                    color = if (batteryUnrestricted) EmeraldActive else Color.White
+                                )
+                            }
 
                             HorizontalDivider(color = Color.White.copy(alpha = 0.10f))
 
                             CoreSubsystemRow(
                                 icon = Icons.Default.Monitor,
                                 title = "Display Virtual & Área Kodasoftr",
-                                detail = "Cria displayId isolado (1920×1080 / 2560×1440) com barra de tarefas, menu e relógio.",
+                                detail = "Tela virtual dedicada para Pen Display com apps roteados e multitarefa nativa.",
                                 ready = bootStage >= 1,
                                 accent = ElectricCyan
                             )
                             CoreSubsystemRow(
+                                icon = Icons.Default.AccessibilityNew,
+                                title = "Cursor Real Global (.cur/.ani/.png) Sem PC",
+                                detail = "Cliques, traços, scroll e cursor único por cima do sistema via Acessibilidade + Overlay.",
+                                ready = bootStage >= 2 || accessibilityEnabled,
+                                accent = EmeraldActive
+                            )
+                            CoreSubsystemRow(
                                 icon = Icons.Default.Speed,
-                                title = "Koda Stream Engine (GPU + USB Bulk)",
-                                detail = "Captura Surface + MediaCodec H.264 direta e envio USB UsbDeviceConnection.bulkTransfer().",
-                                ready = bootStage >= 2,
+                                title = "Auto-Probe Shell & USB OTG Force-Claim",
+                                detail = "Captura interface USB exclusiva do mouse/mesa eliminando seta duplicada + auto daemon se houver root.",
+                                ready = bootStage >= 3,
                                 accent = WintabViolet
                             )
                             CoreSubsystemRow(
-                                icon = Icons.Default.Apps,
-                                title = "Koda App Router & Multitarefa Nativa",
-                                detail = "Vincula aplicativos ao displayId da Pen Display com controle pelos Apps Recentes.",
-                                ready = bootStage >= 3,
-                                accent = ElectricCyan
-                            )
-                            CoreSubsystemRow(
                                 icon = Icons.Default.Draw,
-                                title = "Driver HID WinTab 8192 + Pen Display",
-                                detail = "Detecção automática por VID/PID (Wacom, Huion, XP-Pen, Ugee) e eixo de pressão.",
+                                title = "Driver HID WinTab 8192 + DPI Física",
+                                detail = "Curvas Catmull-Rom, filtros 1€ e calibração de DPI X/Y sem pesar ao deitar o celular.",
                                 ready = bootStage >= 4,
                                 accent = EmeraldActive
                             )
 
-                            Spacer(Modifier.height(4.dp))
+                            Spacer(Modifier.height(2.dp))
 
                             Button(
                                 onClick = {
@@ -381,9 +478,9 @@ fun ActivationScreen(
                                 Spacer(Modifier.width(8.dp))
                                 Text(
                                     text = if (isBootingCore) {
-                                        "Inicializando Motor Principal ($bootStage/4)..."
+                                        "Inicializando Motor Potente ($bootStage/4)..."
                                     } else {
-                                        "Ativar Motor Principal (1 Toque)"
+                                        "Ativar Motor Principal (1 Toque · Sem PC)"
                                     },
                                     style = MaterialTheme.typography.titleMedium,
                                     fontWeight = FontWeight.Bold
@@ -391,40 +488,103 @@ fun ActivationScreen(
                             }
                         }
                     }
+
+                    // Card 2: Explicit "Ativar pelo PC (ADB Shell UID 2000)"
+                    Card(
+                        colors = CardDefaults.cardColors(
+                            containerColor = Color(0xFF101322).copy(alpha = 0.94f)
+                        ),
+                        shape = MaterialTheme.shapes.large,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .border(1.dp, ElectricCyan.copy(alpha = 0.45f), MaterialTheme.shapes.large)
+                            .testTag("pc_activation_card")
+                    ) {
+                        Column(
+                            modifier = Modifier.padding(16.dp),
+                            verticalArrangement = Arrangement.spacedBy(10.dp)
+                        ) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Row(
+                                    modifier = Modifier.weight(1f),
+                                    horizontalArrangement = Arrangement.spacedBy(10.dp),
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Icon(Icons.Default.Computer, contentDescription = null, tint = ElectricCyan)
+                                    Column {
+                                        Text(
+                                            text = "Ativar pelo PC (ADB Shell UID 2000)",
+                                            style = MaterialTheme.typography.titleMedium,
+                                            color = Color.White
+                                        )
+                                        Text(
+                                            text = "Opcional: libera InputManager nativo, pressão 8192 global e TaskStackListener",
+                                            style = MaterialTheme.typography.labelSmall,
+                                            color = Color.White.copy(alpha = 0.72f)
+                                        )
+                                    }
+                                }
+                                FilledTonalButton(
+                                    onClick = { showPcActivationPanel = !showPcActivationPanel },
+                                    modifier = Modifier
+                                        .height(48.dp)
+                                        .testTag("pc_activation_toggle_button")
+                                ) {
+                                    Text(if (showPcActivationPanel) "Recolher" else "Configurar PC")
+                                    Spacer(Modifier.width(4.dp))
+                                    Icon(
+                                        imageVector = if (showPcActivationPanel) Icons.Default.ExpandLess else Icons.Default.ExpandMore,
+                                        contentDescription = null,
+                                        modifier = Modifier.size(18.dp)
+                                    )
+                                }
+                            }
+
+                            AnimatedVisibility(visible = showPcActivationPanel) {
+                                PcAdbCommandSection(
+                                    engineState = engineState,
+                                    copiedConnect = copiedConnect,
+                                    copiedCommand = copiedCommand,
+                                    onSelectTransportMode = onSelectTransportMode,
+                                    onWifiPortChanged = onWifiPortChanged,
+                                    onKeepTerminalOpenChanged = onKeepTerminalOpenChanged,
+                                    onRefreshNetworkIp = onRefreshNetworkIp,
+                                    onCopyConnect = {
+                                        val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
+                                        cm?.setPrimaryClip(ClipData.newPlainText("ADB Connect", engineState.adbConnectCommand))
+                                        copiedConnect = true
+                                    },
+                                    onCopyCommand = {
+                                        val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
+                                        cm?.setPrimaryClip(ClipData.newPlainText("Koda Shell", engineState.adbCommand))
+                                        copiedCommand = true
+                                    },
+                                    onOpenDevSettings = {
+                                        runCatching {
+                                            context.startActivity(Intent(Settings.ACTION_APPLICATION_DEVELOPMENT_SETTINGS))
+                                        }
+                                    },
+                                    onVerifyConnection = {
+                                        onVerifyConnection()
+                                        onSilentPoll()
+                                    }
+                                )
+                            }
+                        }
+                    }
                 }
 
-                // Bottom Optional Wireless Shell Bridge + Signature
+                // Bottom Signature Footer
                 Column(
                     modifier = Modifier
                         .fillMaxWidth()
                         .padding(top = 16.dp),
-                    horizontalAlignment = Alignment.CenterHorizontally,
-                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                    horizontalAlignment = Alignment.CenterHorizontally
                 ) {
-                    TextButton(
-                        onClick = {
-                            onSelectTransportMode(AdbTransportMode.WIFI_NETWORK)
-                            onRefreshNetworkIp()
-                            showOptionalWirelessSheet = true
-                        },
-                        modifier = Modifier
-                            .height(48.dp)
-                            .testTag("optional_wireless_bridge_button")
-                    ) {
-                        Icon(
-                            imageVector = Icons.Default.Wifi,
-                            contentDescription = null,
-                            tint = Color.White.copy(alpha = 0.78f),
-                            modifier = Modifier.size(16.dp)
-                        )
-                        Spacer(Modifier.width(6.dp))
-                        Text(
-                            text = "Ponte Shell Sem Fio (Opcional para TaskStack global)",
-                            style = MaterialTheme.typography.labelMedium,
-                            color = Color.White.copy(alpha = 0.78f)
-                        )
-                    }
-
                     Surface(
                         shape = CircleShape,
                         color = Color.Black.copy(alpha = 0.45f)
@@ -441,83 +601,6 @@ fun ActivationScreen(
                 }
             }
         }
-    }
-
-    if (showOptionalWirelessSheet) {
-        AlertDialog(
-            onDismissRequest = { showOptionalWirelessSheet = false },
-            icon = { Icon(Icons.Default.Terminal, contentDescription = null, tint = ElectricCyan) },
-            title = { Text("Ponte Shell Sem Fio (Opcional)") },
-            text = {
-                Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                    Text(
-                        text = "O Koda Core Engine já funciona sem PC e sem Modo Desenvolvedor. Caso queira também interceptar qualquer app do sistema via TaskStackListener (moveRootTaskToDisplay), conecte a Depuração Sem Fio nativa:",
-                        style = MaterialTheme.typography.bodyMedium
-                    )
-                    Surface(
-                        color = Color(0xFF0A0D18),
-                        shape = MaterialTheme.shapes.small,
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .border(1.dp, MaterialTheme.colorScheme.outline, MaterialTheme.shapes.small)
-                    ) {
-                        Text(
-                            text = engineState.adbCommand,
-                            style = MaterialTheme.typography.labelSmall,
-                            color = EmeraldActive,
-                            modifier = Modifier.padding(10.dp)
-                        )
-                    }
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.spacedBy(8.dp)
-                    ) {
-                        OutlinedButton(
-                            onClick = {
-                                runCatching {
-                                    context.startActivity(Intent(Settings.ACTION_APPLICATION_DEVELOPMENT_SETTINGS))
-                                }
-                            },
-                            modifier = Modifier
-                                .weight(1f)
-                                .height(48.dp)
-                        ) {
-                            Icon(Icons.Default.Settings, contentDescription = null, modifier = Modifier.size(16.dp))
-                            Spacer(Modifier.width(4.dp))
-                            Text("Ajustes", maxLines = 1)
-                        }
-                        FilledTonalButton(
-                            onClick = {
-                                val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
-                                cm?.setPrimaryClip(ClipData.newPlainText("Koda Shell", engineState.adbCommand))
-                                copiedCommand = true
-                            },
-                            modifier = Modifier
-                                .weight(1f)
-                                .height(48.dp)
-                        ) {
-                            Icon(Icons.Default.ContentCopy, contentDescription = null, modifier = Modifier.size(16.dp))
-                            Spacer(Modifier.width(4.dp))
-                            Text(if (copiedCommand) "Copiado" else "Copiar", maxLines = 1)
-                        }
-                    }
-                }
-            },
-            confirmButton = {
-                Button(onClick = {
-                    onVerifyConnection()
-                    onSilentPoll()
-                    showOptionalWirelessSheet = false
-                }) {
-                    Text("Verificar Ponte")
-                }
-            },
-            dismissButton = {
-                TextButton(onClick = { showOptionalWirelessSheet = false }) {
-                    Text("Fechar")
-                }
-            }
-        )
     }
 
     if (errorPopup != null) {
@@ -542,6 +625,178 @@ fun ActivationScreen(
                 }
             }
         )
+    }
+}
+
+@Composable
+fun PcAdbCommandSection(
+    engineState: KodaEngineState,
+    copiedConnect: Boolean,
+    copiedCommand: Boolean,
+    onSelectTransportMode: (AdbTransportMode) -> Unit,
+    onWifiPortChanged: (String) -> Unit,
+    onKeepTerminalOpenChanged: (Boolean) -> Unit,
+    onRefreshNetworkIp: () -> Unit,
+    onCopyConnect: () -> Unit,
+    onCopyCommand: () -> Unit,
+    onOpenDevSettings: () -> Unit,
+    onVerifyConnection: () -> Unit,
+    verifyButtonTag: String = "verify_connection_button"
+) {
+    Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+        HorizontalDivider(color = Color.White.copy(alpha = 0.12f))
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            FilterChip(
+                selected = engineState.transportMode == AdbTransportMode.USB,
+                onClick = { onSelectTransportMode(AdbTransportMode.USB) },
+                leadingIcon = { Icon(Icons.Default.Usb, contentDescription = null, modifier = Modifier.size(16.dp)) },
+                label = { Text("Cabo USB") },
+                modifier = Modifier
+                    .weight(1f)
+                    .testTag("pc_transport_usb_chip")
+            )
+            FilterChip(
+                selected = engineState.transportMode == AdbTransportMode.WIFI_NETWORK,
+                onClick = {
+                    onSelectTransportMode(AdbTransportMode.WIFI_NETWORK)
+                    onRefreshNetworkIp()
+                },
+                leadingIcon = { Icon(Icons.Default.Wifi, contentDescription = null, modifier = Modifier.size(16.dp)) },
+                label = { Text("Wi-Fi / Rede") },
+                modifier = Modifier
+                    .weight(1f)
+                    .testTag("pc_transport_wifi_chip")
+            )
+        }
+
+        if (engineState.transportMode == AdbTransportMode.WIFI_NETWORK) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                OutlinedTextField(
+                    value = engineState.wifiPort,
+                    onValueChange = onWifiPortChanged,
+                    label = { Text("Porta ADB Wi-Fi") },
+                    singleLine = true,
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                    modifier = Modifier.weight(1f)
+                )
+                IconButton(onClick = onRefreshNetworkIp, modifier = Modifier.size(48.dp)) {
+                    Icon(Icons.Default.Refresh, contentDescription = "Atualizar IP", tint = ElectricCyan)
+                }
+            }
+            Surface(
+                color = Color(0xFF0A0D18),
+                shape = MaterialTheme.shapes.small,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .border(1.dp, MaterialTheme.colorScheme.outline, MaterialTheme.shapes.small)
+            ) {
+                Row(
+                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        text = engineState.adbConnectCommand,
+                        style = MaterialTheme.typography.labelSmall,
+                        color = ElectricCyan,
+                        modifier = Modifier.weight(1f)
+                    )
+                    IconButton(onClick = onCopyConnect, modifier = Modifier.size(40.dp)) {
+                        Icon(
+                            imageVector = if (copiedConnect) Icons.Default.CheckCircle else Icons.Default.ContentCopy,
+                            contentDescription = "Copiar adb connect",
+                            tint = if (copiedConnect) EmeraldActive else Color.White,
+                            modifier = Modifier.size(16.dp)
+                        )
+                    }
+                }
+            }
+        }
+
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Text(
+                text = "Manter terminal aberto (--child)",
+                style = MaterialTheme.typography.labelMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.weight(1f)
+            )
+            Switch(
+                checked = engineState.keepTerminalOpenMode,
+                onCheckedChange = onKeepTerminalOpenChanged
+            )
+        }
+
+        Surface(
+            color = Color(0xFF0A0D18),
+            shape = MaterialTheme.shapes.small,
+            modifier = Modifier
+                .fillMaxWidth()
+                .border(1.dp, MaterialTheme.colorScheme.outline, MaterialTheme.shapes.small)
+        ) {
+            Text(
+                text = engineState.adbCommand,
+                style = MaterialTheme.typography.labelSmall,
+                color = EmeraldActive,
+                modifier = Modifier.padding(10.dp)
+            )
+        }
+
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            OutlinedButton(
+                onClick = onOpenDevSettings,
+                modifier = Modifier
+                    .weight(1f)
+                    .height(48.dp)
+            ) {
+                Icon(Icons.Default.Settings, contentDescription = null, modifier = Modifier.size(16.dp))
+                Spacer(Modifier.width(4.dp))
+                Text("Depuração", maxLines = 1)
+            }
+            FilledTonalButton(
+                onClick = onCopyCommand,
+                modifier = Modifier
+                    .weight(1f)
+                    .height(48.dp)
+            ) {
+                Icon(
+                    imageVector = if (copiedCommand) Icons.Default.CheckCircle else Icons.Default.ContentCopy,
+                    contentDescription = null,
+                    modifier = Modifier.size(16.dp)
+                )
+                Spacer(Modifier.width(4.dp))
+                Text(if (copiedCommand) "Copiado" else "Copiar Comando", maxLines = 1)
+            }
+        }
+
+        Button(
+            onClick = onVerifyConnection,
+            colors = ButtonDefaults.buttonColors(
+                containerColor = ElectricCyan,
+                contentColor = Color(0xFF021926)
+            ),
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(50.dp)
+                .testTag(verifyButtonTag)
+        ) {
+            Icon(Icons.Default.Terminal, contentDescription = null, modifier = Modifier.size(18.dp))
+            Spacer(Modifier.width(8.dp))
+            Text("Verificar Conexão PC (ADB)", fontWeight = FontWeight.Bold)
+        }
     }
 }
 

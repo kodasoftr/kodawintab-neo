@@ -3,6 +3,8 @@ package com.example.ui.screens
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
+import android.content.Intent
+import android.provider.Settings
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.Arrangement
@@ -22,7 +24,9 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.filled.AccessibilityNew
 import androidx.compose.material.icons.filled.CheckCircle
+import androidx.compose.material.icons.filled.Computer
 import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.Layers
@@ -61,8 +65,10 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import com.example.koda.engine.AdbTransportMode
 import com.example.koda.engine.KodaEngineState
 import com.example.ui.theme.AmberAccent
+import com.example.ui.theme.ElectricCyan
 import com.example.ui.theme.EmeraldActive
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -75,11 +81,21 @@ fun PrivilegeStatusScreen(
     onSilentReconnect: () -> Unit,
     onGrantOverlayViaAdb: () -> Unit,
     onOpenOverlaySettings: () -> Unit,
-    modifier: Modifier = Modifier
+    modifier: Modifier = Modifier,
+    accessibilityEnabled: Boolean = false,
+    batteryUnrestricted: Boolean = false,
+    onVerifyPcConnection: () -> Unit = {},
+    onSelectTransportMode: (AdbTransportMode) -> Unit = {},
+    onWifiPortChanged: (String) -> Unit = {},
+    onKeepTerminalOpenChanged: (Boolean) -> Unit = {},
+    onRefreshNetworkIp: () -> Unit = {},
+    onOpenAccessibilitySettings: () -> Unit = {},
+    onOpenBatteryOptimizationSettings: () -> Unit = {}
 ) {
     val context = LocalContext.current
     var showAdbReferenceDialog by remember { mutableStateOf(false) }
     var copiedCommand by remember { mutableStateOf(false) }
+    var copiedConnect by remember { mutableStateOf(false) }
 
     val statusAccent = if (engineState.isActive) EmeraldActive else Color(0xFF00D4B4)
 
@@ -88,12 +104,12 @@ fun PrivilegeStatusScreen(
             TopAppBar(
                 title = {
                     Column {
-                        Text("Privilégios Permanentes", style = MaterialTheme.typography.titleLarge)
+                        Text("Privilégios & Ativação", style = MaterialTheme.typography.titleLarge)
                         Text(
                             text = if (engineState.isActive) {
-                                "Shell Ativo (UID ${engineState.serverUid}) · Modo OTG Direto"
+                                "Shell PC Ativo (UID ${engineState.serverUid}) · Modo OTG Direto"
                             } else {
-                                "Ativação 1-Vez Salva · Operando via OTG Permanente"
+                                "Motor Autônomo Salvo · OTG Permanente + Opção PC"
                             },
                             style = MaterialTheme.typography.labelSmall,
                             color = statusAccent
@@ -129,7 +145,7 @@ fun PrivilegeStatusScreen(
                     .padding(horizontal = 20.dp, vertical = 16.dp),
                 verticalArrangement = Arrangement.spacedBy(14.dp)
             ) {
-                // Hero Permanent Activation Card (Read-only guarantee: never revokes or deactivates privileges)
+                // Hero Permanent Activation Card
                 Card(
                     colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
                     modifier = Modifier
@@ -176,13 +192,13 @@ fun PrivilegeStatusScreen(
                                     }
                                     Column {
                                         Text(
-                                            text = "ATIVADO PERMANENTE",
+                                            text = if (engineState.isActive) "SHELL UID ${engineState.serverUid} ATIVO" else "ATIVADO PERMANENTE",
                                             style = MaterialTheme.typography.titleLarge,
                                             color = statusAccent,
                                             fontWeight = FontWeight.Bold
                                         )
                                         Text(
-                                            text = "Privilégio salvo · Só reseta ao limpar dados do app",
+                                            text = "Privilégio salvo · Opera com ou sem PC",
                                             style = MaterialTheme.typography.labelMedium,
                                             color = MaterialTheme.colorScheme.onSurfaceVariant
                                         )
@@ -204,7 +220,7 @@ fun PrivilegeStatusScreen(
                             }
 
                             Text(
-                                text = "Você já concluiu a ativação única via ADB. Pode desconectar o cabo do PC e desligar o Modo Desenvolvedor: o driver USB OTG da mesa e suas permissões continuam liberados automaticamente sempre que abrir o app (mesmo após Forçar Parada).",
+                                text = "O driver USB OTG da mesa e suas configurações permanecem ativos automaticamente. Sem PC, use Acessibilidade + Sobreposição para operar o cursor em qualquer app; se quiser injeção em nível de sistema (InputManager + pressão global), use a ponte PC ADB abaixo.",
                                 style = MaterialTheme.typography.bodyMedium,
                                 color = MaterialTheme.colorScheme.onSurface
                             )
@@ -212,40 +228,75 @@ fun PrivilegeStatusScreen(
                     }
                 }
 
-                // Privilege Breakdown Rows
+                // Standalone Global Real Cursor (AccessibilityService)
                 PrivilegeLayerCard(
-                    icon = Icons.Default.Usb,
-                    title = "USB OTG Seletivo & Pass-Through ADB",
-                    badge = if (usbDeviceCount > 0) "$usbDeviceCount periférico(s) em uso" else "OTG Pronto",
-                    badgeColor = EmeraldActive,
-                    description = "O Koda reivindica apenas mesas digitalizadoras e mouses configurados no Hub. Comandos ADB do PC, instalação de APKs, MTP/arquivos e teclados passam livremente pelo sistema sem bloqueio."
-                )
-
-                PrivilegeLayerCard(
-                    icon = Icons.Default.Terminal,
-                    title = if (engineState.isActive) {
-                        "KodaShellServer Conectado (UID ${engineState.serverUid} · PID ${engineState.serverPid})"
+                    icon = Icons.Default.AccessibilityNew,
+                    title = "Cursor Real Global Sem PC (Acessibilidade)",
+                    badge = if (accessibilityEnabled) "Ativo Sem PC" else "Ativar 1x",
+                    badgeColor = if (accessibilityEnabled) EmeraldActive else ElectricCyan,
+                    description = if (accessibilityEnabled) {
+                        "Serviço Koda Acessibilidade ativo! Seu cursor .cur/.ani/.png clica, arrasta, rola e funciona por cima do sistema inteiro e todos os apps mesmo sem PC."
                     } else {
-                        "Motor Shell em Standby OTG"
-                    },
-                    badge = if (engineState.isActive) "Socket Ativo" else "OTG Direto Ativo",
-                    badgeColor = if (engineState.isActive) EmeraldActive else Color(0xFF00D4B4),
-                    description = if (engineState.isActive) {
-                        "Injeção global de eventos e ocultamento nativo do cursor estão operando em tempo real entre apps."
-                    } else {
-                        "Com o PC desconectado ou Opções do Desenvolvedor desligadas, os recursos OTG, curvas, calibração e overlay continuam ativos normalmente sem pedir ADB novamente."
+                        "Ative o serviço de Acessibilidade 'Koda WinTab - Cursor Global' para que o cursor da mesa e do mouse clique e arraste em outros apps sem precisar de PC."
                     }
                 )
+                if (!accessibilityEnabled) {
+                    Button(
+                        onClick = onOpenAccessibilitySettings,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(48.dp)
+                            .testTag("privilege_enable_accessibility_button")
+                    ) {
+                        Icon(Icons.Default.AccessibilityNew, contentDescription = null, modifier = Modifier.size(18.dp))
+                        Spacer(Modifier.width(8.dp))
+                        Text("Ativar Cursor Global Sem PC (Acessibilidade)")
+                    }
+                }
 
+                // USB OTG Layer
+                PrivilegeLayerCard(
+                    icon = Icons.Default.Usb,
+                    title = "USB OTG Exclusivo (Sem Cursor Duplo)",
+                    badge = if (usbDeviceCount > 0) "$usbDeviceCount periférico(s) em uso" else "OTG Pronto",
+                    badgeColor = EmeraldActive,
+                    description = "O Koda reivindica mesas digitalizadoras e mouses USB com claimInterface(force=true) em todas as sub-interfaces HID, bloqueando a seta nativa duplicada enquanto preserva ADB e teclado."
+                )
+
+                // Background Persistence Layer
+                PrivilegeLayerCard(
+                    icon = Icons.Default.Sync,
+                    title = "Segundo Plano Sem Cortes (Apps de Desenho)",
+                    badge = if (batteryUnrestricted) "Sem Restrições" else "Ajustar",
+                    badgeColor = if (batteryUnrestricted) EmeraldActive else AmberAccent,
+                    description = if (batteryUnrestricted) {
+                        "Bateria sem restrições ativada: o driver da mesa e o cursor personalizado continuam ativos ao abrir Krita, ibisPaint ou fechar a janela."
+                    } else {
+                        "Desative a economia de bateria para o Koda para que o Android não encerre a mesa digitalizadora quando você abrir outros aplicativos."
+                    }
+                )
+                if (!batteryUnrestricted) {
+                    OutlinedButton(
+                        onClick = onOpenBatteryOptimizationSettings,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(48.dp)
+                            .testTag("privilege_battery_unrestricted_button")
+                    ) {
+                        Text("Liberar Bateria Sem Restrições")
+                    }
+                }
+
+                // Overlay Permission Layer
                 PrivilegeLayerCard(
                     icon = Icons.Default.Layers,
                     title = "Cursor Global sobre Outros Apps (.cur / .ani / .png)",
                     badge = if (overlayGranted) "Liberado" else "Pendente",
                     badgeColor = if (overlayGranted) EmeraldActive else AmberAccent,
                     description = if (overlayGranted) {
-                        "Permissão de sobreposição concedida. Ao pausar ou usar Forçar Parada ela congela e retorna ativa quando você reabrir o Koda Wintab."
+                        "Permissão de sobreposição concedida. O cursor personalizado aparece acima do Android Launcher e de qualquer aplicativo aberto."
                     } else {
-                        "Conceda a permissão 'Sobrepor a outros apps' uma vez para manter o cursor customizado por cima de outros aplicativos."
+                        "Conceda 'Sobrepor a outros apps' (ou ative a Acessibilidade acima) para o cursor ficar sempre visível sobre tudo."
                     }
                 )
 
@@ -272,6 +323,83 @@ fun PrivilegeStatusScreen(
                                 Text("Liberar via Engine")
                             }
                         }
+                    }
+                }
+
+                // Explicit "Ativar pelo PC (ADB Shell UID 2000)" Card
+                Card(
+                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .border(1.dp, ElectricCyan.copy(alpha = 0.55f), MaterialTheme.shapes.large)
+                        .testTag("privilege_pc_activation_card")
+                ) {
+                    Column(
+                        modifier = Modifier.padding(16.dp),
+                        verticalArrangement = Arrangement.spacedBy(10.dp)
+                    ) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Row(
+                                modifier = Modifier.weight(1f),
+                                horizontalArrangement = Arrangement.spacedBy(10.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Icon(Icons.Default.Computer, contentDescription = null, tint = ElectricCyan)
+                                Column {
+                                    Text(
+                                        text = if (engineState.isActive) {
+                                            "Ponte PC ADB Ativa (UID ${engineState.serverUid} · PID ${engineState.serverPid})"
+                                        } else {
+                                            "Ativar / Conectar pelo PC (ADB Shell)"
+                                        },
+                                        style = MaterialTheme.typography.titleMedium
+                                    )
+                                    Text(
+                                        text = if (engineState.isActive) {
+                                            "Injeção InputManager nativa, pressão 8192 global e bloqueio do cursor do sistema ativos."
+                                        } else {
+                                            "Conecte via cabo USB ou Wi-Fi para elevar a Engine para poderes ADB Shell (UID 2000)."
+                                        },
+                                        style = MaterialTheme.typography.bodyMedium,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                                    )
+                                }
+                            }
+                        }
+
+                        PcAdbCommandSection(
+                            engineState = engineState,
+                            copiedConnect = copiedConnect,
+                            copiedCommand = copiedCommand,
+                            onSelectTransportMode = onSelectTransportMode,
+                            onWifiPortChanged = onWifiPortChanged,
+                            onKeepTerminalOpenChanged = onKeepTerminalOpenChanged,
+                            onRefreshNetworkIp = onRefreshNetworkIp,
+                            onCopyConnect = {
+                                val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
+                                cm?.setPrimaryClip(ClipData.newPlainText("ADB Connect", engineState.adbConnectCommand))
+                                copiedConnect = true
+                            },
+                            onCopyCommand = {
+                                val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
+                                cm?.setPrimaryClip(ClipData.newPlainText("Koda ADB", engineState.adbCommand))
+                                copiedCommand = true
+                            },
+                            onOpenDevSettings = {
+                                runCatching {
+                                    context.startActivity(Intent(Settings.ACTION_APPLICATION_DEVELOPMENT_SETTINGS))
+                                }
+                            },
+                            onVerifyConnection = {
+                                onVerifyPcConnection()
+                                onSilentReconnect()
+                            },
+                            verifyButtonTag = "privilege_verify_pc_button"
+                        )
                     }
                 }
 
@@ -305,7 +433,7 @@ fun PrivilegeStatusScreen(
 
                 Spacer(Modifier.height(6.dp))
                 Text(
-                    text = "developed by Gabriel Freitas · Ativação permanente protegida",
+                    text = "developed by Gabriel Freitas · Engine Autônoma + Ponte PC",
                     style = MaterialTheme.typography.labelSmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     modifier = Modifier.align(Alignment.CenterHorizontally)
@@ -322,7 +450,7 @@ fun PrivilegeStatusScreen(
             text = {
                 Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
                     Text(
-                        text = "Seu app já está com a ativação permanente salva. Só use este comando novamente caso você limpe os dados de armazenamento do Koda Wintab ou reinicie o aparelho e queira religar o daemon Shell:",
+                        text = "Cole este comando no Prompt/Terminal do PC para elevar a Koda Engine ao processo Shell (UID 2000):",
                         style = MaterialTheme.typography.bodyMedium
                     )
                     Surface(

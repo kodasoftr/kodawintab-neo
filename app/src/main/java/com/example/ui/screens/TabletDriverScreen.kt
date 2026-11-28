@@ -62,6 +62,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -614,7 +615,7 @@ private fun TabletAreaAndRotationTab(
                     .border(1.dp, outline, MaterialTheme.shapes.medium)
                     .padding(12.dp)
                     .onSizeChanged { areaCanvasSize = it }
-                    .pointerInput(config.activeArea) {
+                    .pointerInput(Unit) {
                         detectDragGestures { change, dragAmount ->
                             val wPx = areaCanvasSize.width.coerceAtLeast(1).toFloat()
                             val hPx = areaCanvasSize.height.coerceAtLeast(1).toFloat()
@@ -878,11 +879,29 @@ private fun TabletAreaAndRotationTab(
                     it.copy(activeArea = it.activeArea.copy(heightNorm = h, topNorm = clampedT))
                 }
             }
-            AreaSliderRow("Deslocamento X", config.activeArea.leftNorm, 0f..(1f - config.activeArea.widthNorm).coerceAtLeast(0.01f)) { x ->
-                onUpdateConfig { it.copy(activeArea = it.activeArea.copy(leftNorm = x)) }
+            val maxOffsetX = (1f - config.activeArea.widthNorm).coerceAtLeast(0f)
+            val maxOffsetY = (1f - config.activeArea.heightNorm).coerceAtLeast(0f)
+            AreaSliderRow(
+                label = "Deslocamento X",
+                value = config.activeArea.leftNorm,
+                range = 0f..maxOffsetX.coerceAtLeast(0.001f),
+                enabled = maxOffsetX > 0.005f
+            ) { x ->
+                onUpdateConfig {
+                    val mx = (1f - it.activeArea.widthNorm).coerceAtLeast(0f)
+                    it.copy(activeArea = it.activeArea.copy(leftNorm = x.coerceIn(0f, mx)))
+                }
             }
-            AreaSliderRow("Deslocamento Y", config.activeArea.topNorm, 0f..(1f - config.activeArea.heightNorm).coerceAtLeast(0.01f)) { y ->
-                onUpdateConfig { it.copy(activeArea = it.activeArea.copy(topNorm = y)) }
+            AreaSliderRow(
+                label = "Deslocamento Y",
+                value = config.activeArea.topNorm,
+                range = 0f..maxOffsetY.coerceAtLeast(0.001f),
+                enabled = maxOffsetY > 0.005f
+            ) { y ->
+                onUpdateConfig {
+                    val my = (1f - it.activeArea.heightNorm).coerceAtLeast(0f)
+                    it.copy(activeArea = it.activeArea.copy(topNorm = y.coerceIn(0f, my)))
+                }
             }
 
             Row(
@@ -929,18 +948,25 @@ private fun AreaSliderRow(
     label: String,
     value: Float,
     range: ClosedFloatingPointRange<Float>,
+    enabled: Boolean = true,
     onValueChange: (Float) -> Unit
 ) {
+    val safeRange = if (range.endInclusive > range.start) range else range.start..(range.start + 0.001f)
     Column {
         Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
             Text(label, style = MaterialTheme.typography.bodyMedium)
             Text(
                 text = String.format(Locale.US, "%.0f%%", value * 100f),
                 style = MaterialTheme.typography.labelMedium,
-                color = MaterialTheme.colorScheme.primary
+                color = if (enabled) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant
             )
         }
-        Slider(value = value.coerceIn(range.start, range.endInclusive), onValueChange = onValueChange, valueRange = range)
+        Slider(
+            value = value.coerceIn(safeRange.start, safeRange.endInclusive),
+            onValueChange = onValueChange,
+            enabled = enabled,
+            valueRange = safeRange
+        )
     }
 }
 
@@ -1084,6 +1110,7 @@ private fun PenPressureTab(
                 )
             }
 
+            val currentSortedCurve by rememberUpdatedState(sortedPts)
             Box(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -1092,14 +1119,15 @@ private fun PenPressureTab(
                     .background(Color(0xFF0B0D18))
                     .border(1.dp, outline, MaterialTheme.shapes.medium)
                     .onSizeChanged { canvasSize = it }
-                    .pointerInput(config.pressureCurve) {
+                    .pointerInput(Unit) {
                         detectDragGestures(
                             onDragStart = { pos ->
+                                val pts = currentSortedCurve
                                 val w = canvasSize.width.coerceAtLeast(1).toFloat()
                                 val h = canvasSize.height.coerceAtLeast(1).toFloat()
                                 var bestIdx = -1
                                 var bestDist = 110f
-                                config.pressureCurve.forEachIndexed { idx, pt ->
+                                pts.forEachIndexed { idx, pt ->
                                     val px = pt.inputNorm * w
                                     val py = (1f - pt.outputNorm) * h
                                     val d = hypot(pos.x - px, pos.y - py)
@@ -1111,7 +1139,8 @@ private fun PenPressureTab(
                                 activeDragIndex = bestIdx
                             },
                             onDrag = { change, _ ->
-                                if (activeDragIndex in config.pressureCurve.indices) {
+                                val pts = currentSortedCurve
+                                if (activeDragIndex in pts.indices) {
                                     val w = canvasSize.width.coerceAtLeast(1).toFloat()
                                     val h = canvasSize.height.coerceAtLeast(1).toFloat()
                                     val nx = (change.position.x / w).coerceIn(0f, 1f)
@@ -1120,7 +1149,8 @@ private fun PenPressureTab(
                                 }
                                 change.consume()
                             },
-                            onDragEnd = { activeDragIndex = -1 }
+                            onDragEnd = { activeDragIndex = -1 },
+                            onDragCancel = { activeDragIndex = -1 }
                         )
                     }
             ) {
@@ -1203,8 +1233,8 @@ private fun PenPressureTab(
                     Text("0%", style = MaterialTheme.typography.labelSmall, color = outline)
                 }
 
-                if (activeDragIndex in config.pressureCurve.indices) {
-                    val activePt = config.pressureCurve[activeDragIndex]
+                if (activeDragIndex in sortedPts.indices) {
+                    val activePt = sortedPts[activeDragIndex]
                     Surface(
                         color = Color(0xCC121426),
                         shape = MaterialTheme.shapes.small,

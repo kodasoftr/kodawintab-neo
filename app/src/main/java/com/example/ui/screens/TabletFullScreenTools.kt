@@ -261,52 +261,24 @@ fun FullScreenBlankSheetStrokeDialog(
                                     )
                                 } else if (event.type == PointerEventType.Move && change.pressed) {
                                     val prev = lastTouchPoint ?: change.position
-                                    val p = change.pressure.takeIf { it > 0f } ?: 0.72f
-                                    strokes.add(
-                                        SheetStrokeSegment(
-                                            start = prev,
-                                            end = change.position,
-                                            pressure = p,
-                                            color = inkColor
+                                    if (hypot(change.position.x - prev.x, change.position.y - prev.y) > 0.35f) {
+                                        val p = change.pressure.takeIf { it > 0f } ?: 0.72f
+                                        strokes.add(
+                                            SheetStrokeSegment(
+                                                start = prev,
+                                                end = change.position,
+                                                pressure = p,
+                                                color = inkColor
+                                            )
                                         )
-                                    )
-                                    lastTouchPoint = change.position
+                                        lastTouchPoint = change.position
+                                    }
+                                    change.consume()
                                 } else if (event.type == PointerEventType.Release) {
                                     lastTouchPoint = null
                                 }
                             }
                         }
-                    }
-                    .pointerInput(inkColor) {
-                        detectDragGestures(
-                            onDragStart = { offset ->
-                                lastTouchPoint = offset
-                                localCursor = offset
-                            },
-                            onDrag = { change, _ ->
-                                val prev = lastTouchPoint ?: change.position
-                                val pressure = change.pressure.takeIf { it > 0f } ?: 0.72f
-                                if (hypot(change.position.x - prev.x, change.position.y - prev.y) > 0.35f) {
-                                    strokes.add(
-                                        SheetStrokeSegment(
-                                            start = prev,
-                                            end = change.position,
-                                            pressure = pressure,
-                                            color = inkColor
-                                        )
-                                    )
-                                }
-                                lastTouchPoint = change.position
-                                localCursor = change.position
-                                change.consume()
-                            },
-                            onDragEnd = {
-                                lastTouchPoint = null
-                            },
-                            onDragCancel = {
-                                lastTouchPoint = null
-                            }
-                        )
                     }
                     .testTag("blank_sheet_canvas")
             ) {
@@ -506,17 +478,18 @@ fun FullScreenCalibrationDialog(
     var stepEnteredAtMs by remember { mutableLongStateOf(0L) }
     val scope = rememberCoroutineScope()
 
-    fun commitPointCapture(tapNorm: Offset?) {
+    fun commitPointCapture(tapNorm: Offset?, fromTablet: Boolean) {
         if (phase != CalibrationPhase.CAPTURING || pointConfirmedGreen) return
         val safeMaxX = maxRawX.coerceAtLeast(1).toFloat()
         val safeMaxY = maxRawY.coerceAtLeast(1).toFloat()
-        val rx = if (telemetry.lastRawX > 0) {
+        val useTabletRaw = fromTablet && telemetry.lastRawX > 0 && telemetry.lastRawY > 0
+        val rx = if (useTabletRaw) {
             telemetry.lastRawX
         } else {
             val fallback = tapNorm ?: targetPoints[currentStep].first
             (fallback.x * safeMaxX).roundToInt()
         }
-        val ry = if (telemetry.lastRawY > 0) {
+        val ry = if (useTabletRaw) {
             telemetry.lastRawY
         } else {
             val fallback = tapNorm ?: targetPoints[currentStep].first
@@ -560,7 +533,7 @@ fun FullScreenCalibrationDialog(
         ) {
             val nx = if (canvasSize.width > 1) (telemetry.lastScreenX / canvasSize.width).coerceIn(0f, 1f) else null
             val ny = if (canvasSize.height > 1) (telemetry.lastScreenY / canvasSize.height).coerceIn(0f, 1f) else null
-            commitPointCapture(if (nx != null && ny != null) Offset(nx, ny) else null)
+            commitPointCapture(if (nx != null && ny != null) Offset(nx, ny) else null, fromTablet = true)
         }
         prevTelemetryTipDown = telemetry.isTipDown
     }
@@ -740,7 +713,7 @@ fun FullScreenCalibrationDialog(
                                     if (SystemClock.uptimeMillis() - stepEnteredAtMs >= 160L) {
                                         val nx = (offset.x / canvasSize.width.coerceAtLeast(1)).coerceIn(0f, 1f)
                                         val ny = (offset.y / canvasSize.height.coerceAtLeast(1)).coerceIn(0f, 1f)
-                                        commitPointCapture(Offset(nx, ny))
+                                        commitPointCapture(Offset(nx, ny), fromTablet = false)
                                     }
                                 }
                             }
@@ -833,7 +806,7 @@ fun FullScreenCalibrationDialog(
                                 }
 
                                 Button(
-                                    onClick = { commitPointCapture(null) },
+                                    onClick = { commitPointCapture(null, fromTablet = false) },
                                     modifier = Modifier
                                         .height(42.dp)
                                         .testTag("calibration_confirm_step_button")

@@ -38,6 +38,9 @@ class TabletPipeline(
     @Volatile private var cachedB2Action: ParsedBindingAction = KeyBindingCatalog.parseAction("Borracha / Pan")
     @Volatile var virtualDeviceId: Int = TabletSlotId.GLOBAL.virtualDeviceId
     @Volatile var onCursorCoordinate: ((x: Float, y: Float, isVisible: Boolean, fromTablet: Boolean) -> Unit)? = null
+    @Volatile var onStylusSample: ((x: Float, y: Float, pressure: Float, isTipDown: Boolean, tiltX: Float, tiltY: Float) -> Unit)? = null
+    @Volatile var onInAppStylusEvent: ((eventTimeMs: Long, action: Int, x: Float, y: Float, pressure: Float, tiltXDeg: Float, tiltYDeg: Float, isEraser: Boolean, buttonState: Int) -> Unit)? = null
+    @Volatile var onInAppKeyEvent: ((action: Int, keyCode: Int, metaState: Int) -> Unit)? = null
 
     private val running = AtomicBoolean(false)
     @Volatile private var workerThread: Thread? = null
@@ -55,6 +58,7 @@ class TabletPipeline(
     private val scratchReport = TabletReport()
     private val scratchFilteredXY = FloatArray(2)
     private val scratchScreenXY = FloatArray(2)
+    private val scratchTransformedTilt = FloatArray(2)
     private val batchBuffer = ArrayList<StylusSample>(16)
 
     private var prevTipDown = false
@@ -67,6 +71,8 @@ class TabletPipeline(
     private var lastRelRawY = -1f
     private var relCursorX = 540f
     private var relCursorY = 960f
+    private var prevPacketNs = 0L
+    private var lastSampleTimeMs = 0L
     @Volatile private var displayWidthPx = 1080f
     @Volatile private var displayHeightPx = 1920f
     @Volatile private var currentDisplayRotationDeg = 0
@@ -257,12 +263,35 @@ class TabletPipeline(
                         (scratchReport.barrelButton1 && b1Action.isEraserToggle) ||
                         (scratchReport.barrelButton2 && b2Action.isEraserToggle)
 
+                    transformTilt(
+                        tiltXDeg = scratchReport.tiltXDeg,
+                        tiltYDeg = scratchReport.tiltYDeg,
+                        rotationDeg = matrix.effectiveRotationDeg,
+                        invertX = config.invertX,
+                        invertY = config.invertY,
+                        outXY = scratchTransformedTilt
+                    )
+                    val screenTiltX = scratchTransformedTilt[0]
+                    val screenTiltY = scratchTransformedTilt[1]
+
+                    val nowUptimeMs = SystemClock.uptimeMillis()
+                    val pktNs = scratchMeta[0]
+                    val sampleTimeMs = computeMonotonicSampleTimeMs(nowUptimeMs, pktNs)
+
                     var buttons = 0
-                    if (scratchReport.barrelButton1) {
-                        buttons = buttons or if (b1Action.isRightClick) MotionEvent.BUTTON_SECONDARY else MotionEvent.BUTTON_STYLUS_PRIMARY
+                    if (scratchReport.barrelButton1 && !b1Action.isDisabled && b1Action.keyCode == android.view.KeyEvent.KEYCODE_UNKNOWN) {
+                        buttons = buttons or when {
+                            b1Action.isRightClick -> MotionEvent.BUTTON_SECONDARY
+                            b1Action.isMiddleClick -> MotionEvent.BUTTON_TERTIARY
+                            else -> MotionEvent.BUTTON_STYLUS_PRIMARY
+                        }
                     }
-                    if (scratchReport.barrelButton2) {
-                        buttons = buttons or if (b2Action.isRightClick) MotionEvent.BUTTON_SECONDARY else if (b2Action.isMiddleClick) MotionEvent.BUTTON_TERTIARY else MotionEvent.BUTTON_STYLUS_SECONDARY
+                    if (scratchReport.barrelButton2 && !b2Action.isDisabled && b2Action.keyCode == android.view.KeyEvent.KEYCODE_UNKNOWN) {
+                        buttons = buttons or when {
+                            b2Action.isRightClick -> MotionEvent.BUTTON_SECONDARY
+                            b2Action.isMiddleClick -> MotionEvent.BUTTON_TERTIARY
+                            else -> MotionEvent.BUTTON_STYLUS_SECONDARY
+                        }
                     }
 
                     val t3Start = System.nanoTime()
@@ -275,6 +304,14 @@ class TabletPipeline(
                             true
                         )
                     }
+                    onStylusSample?.invoke(
+                        scratchScreenXY[0],
+                        scratchScreenXY[1],
+                        effectivePressure,
+                        scratchReport.isTipDown,
+                        screenTiltX,
+                        screenTiltY
+                    )
 
                     if (engineClient.state.value.isActive) {
                         val isSingleTransition = action == MotionEvent.ACTION_DOWN ||
@@ -295,12 +332,12 @@ class TabletPipeline(
                         batchEraser = eraserActive
                         batchBuffer.add(
                             StylusSample(
-                                eventTimeMs = SystemClock.uptimeMillis(),
+                                eventTimeMs = sampleTimeMs,
                                 x = scratchScreenXY[0],
                                 y = scratchScreenXY[1],
                                 pressure = effectivePressure,
-                                tiltX = scratchReport.tiltXDeg,
-                                tiltY = scratchReport.tiltYDeg,
+                                tiltX = screenTiltX,
+                                tiltY = screenTiltY,
                                 buttonState = buttons
                             )
                         )
@@ -316,14 +353,27 @@ class TabletPipeline(
                         }
                     } else {
                         if (batchBuffer.isNotEmpty()) batchBuffer.clear()
-                        // Standalone PC-free global stylus stroke dispatch via KodaAccessibilityService
+                        // Standalone App Engine mode (no PC/ADB): Accessibility global stroke OR direct in-app MotionEvent
                         val a11y = com.example.hub.KodaAccessibilityService.activeInstance()
                         if (a11y != null && !a11y.isForegroundInOwnApp()) {
                             when (action) {
                                 MotionEvent.ACTION_DOWN -> a11y.dispatchPointerDown(scratchScreenXY[0], scratchScreenXY[1])
                                 MotionEvent.ACTION_MOVE -> a11y.dispatchPointerMove(scratchScreenXY[0], scratchScreenXY[1])
                                 MotionEvent.ACTION_UP -> a11y.dispatchPointerUp(scratchScreenXY[0], scratchScreenXY[1])
+                                MotionEvent.ACTION_CANCEL -> a11y.cancelActiveStroke()
                             }
+                        } else {
+                            onInAppStylusEvent?.invoke(
+                                sampleTimeMs,
+                                action,
+                                scratchScreenXY[0],
+                                scratchScreenXY[1],
+                                effectivePressure,
+                                screenTiltX,
+                                screenTiltY,
+                                eraserActive,
+                                buttons
+                            )
                         }
                     }
                     val t3End = System.nanoTime()
@@ -432,7 +482,24 @@ class TabletPipeline(
                 if ((changed and mask) != 0) {
                     val isDown = (report.expressKeyMask and mask) != 0
                     val act = bindings.expressKeyActions[bit] ?: continue
-                    KeyBindingCatalog.dispatchBindingPress(engineClient, kbDevId, act, isDown)
+                    if (engineClient.state.value.isActive) {
+                        KeyBindingCatalog.dispatchBindingPress(engineClient, kbDevId, act, isDown)
+                    } else {
+                        val parsed = KeyBindingCatalog.parseAction(act)
+                        val a11y = com.example.hub.KodaAccessibilityService.activeInstance()
+                        if (a11y != null && !a11y.isForegroundInOwnApp()) {
+                            if (isDown) {
+                                if (parsed.isRightClick) a11y.performSystemBack()
+                                else if (parsed.isMiddleClick) a11y.performSystemHome()
+                            }
+                        } else if (!parsed.isDisabled && parsed.keyCode != android.view.KeyEvent.KEYCODE_UNKNOWN) {
+                            onInAppKeyEvent?.invoke(
+                                if (isDown) android.view.KeyEvent.ACTION_DOWN else android.view.KeyEvent.ACTION_UP,
+                                parsed.keyCode,
+                                parsed.metaState
+                            )
+                        }
+                    }
                     if (isDown) lastShortcutLabel = "Express ${bit + 1} → $act"
                 }
             }
@@ -470,6 +537,19 @@ class TabletPipeline(
         }
     }
 
+    private fun computeMonotonicSampleTimeMs(nowUptimeMs: Long, packetNs: Long): Long {
+        val candidate = if (packetNs > 0L && prevPacketNs > 0L && lastSampleTimeMs > 0L && packetNs >= prevPacketNs) {
+            val deltaMs = ((packetNs - prevPacketNs) / 1_000_000L).coerceIn(0L, 40L)
+            maxOf(lastSampleTimeMs + deltaMs, nowUptimeMs - 20L).coerceAtMost(nowUptimeMs)
+        } else {
+            nowUptimeMs
+        }
+        prevPacketNs = packetNs
+        val monotonic = if (candidate >= lastSampleTimeMs) candidate else lastSampleTimeMs
+        lastSampleTimeMs = monotonic
+        return monotonic
+    }
+
     fun stop() {
         running.set(false)
         workerThread?.let {
@@ -477,9 +557,12 @@ class TabletPipeline(
             it.interrupt()
         }
         workerThread = null
+        batchBuffer.clear()
         filters.reset()
         lastRelRawX = -1f
         lastRelRawY = -1f
+        prevPacketNs = 0L
+        lastSampleTimeMs = 0L
         prevTipDown = false
         prevHovering = false
         prevBarrel1 = false
@@ -489,5 +572,35 @@ class TabletPipeline(
 
     companion object {
         private val HEX_CHARS = "0123456789ABCDEF".toCharArray()
+
+        fun transformTilt(
+            tiltXDeg: Float,
+            tiltYDeg: Float,
+            rotationDeg: Int,
+            invertX: Boolean,
+            invertY: Boolean,
+            outXY: FloatArray
+        ) {
+            val ix = if (invertX) -tiltXDeg else tiltXDeg
+            val iy = if (invertY) -tiltYDeg else tiltYDeg
+            when (((rotationDeg % 360) + 360) % 360) {
+                90 -> {
+                    outXY[0] = -iy
+                    outXY[1] = ix
+                }
+                180 -> {
+                    outXY[0] = -ix
+                    outXY[1] = -iy
+                }
+                270 -> {
+                    outXY[0] = iy
+                    outXY[1] = -ix
+                }
+                else -> {
+                    outXY[0] = ix
+                    outXY[1] = iy
+                }
+            }
+        }
     }
 }

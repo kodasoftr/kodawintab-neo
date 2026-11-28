@@ -154,19 +154,21 @@ class KodaStreamEngine(
                         fpsWindowStart = nowMs
                     }
                     val encodeMs = (System.nanoTime() - t0) / 1_000_000f
-                    _telemetry.value = _telemetry.value.copy(
-                        isStreaming = true,
-                        widthPx = width,
-                        heightPx = height,
-                        fps = if (measuredFps > 0) measuredFps else 60,
-                        targetBitrateMbps = bitrateMbps,
-                        encodedFrames = frameSeq,
-                        usbPacketsSent = usbPackets,
-                        usbBytesSent = usbBytes,
-                        lastFrameBytes = size,
-                        encodeLatencyMs = encodeMs,
-                        usbBulkTransportActive = usbCoordinator.hasUsbVideoBulkTransport()
-                    )
+                    if (running.get()) {
+                        _telemetry.value = _telemetry.value.copy(
+                            isStreaming = true,
+                            widthPx = width,
+                            heightPx = height,
+                            fps = if (measuredFps > 0) measuredFps else 60,
+                            targetBitrateMbps = bitrateMbps,
+                            encodedFrames = frameSeq,
+                            usbPacketsSent = usbPackets,
+                            usbBytesSent = usbBytes,
+                            lastFrameBytes = size,
+                            encodeLatencyMs = encodeMs,
+                            usbBulkTransportActive = usbCoordinator.hasUsbVideoBulkTransport()
+                        )
+                    }
                 }
             }
         }, "KodaStreamEncoderDrain").apply {
@@ -201,8 +203,12 @@ class KodaStreamEngine(
 
     fun stop() {
         running.set(false)
-        drainThread?.interrupt()
+        val t = drainThread
         drainThread = null
+        t?.interrupt()
+        if (t != null && t !== Thread.currentThread()) {
+            runCatching { t.join(300) }
+        }
         runCatching {
             mediaCodec?.stop()
             mediaCodec?.release()

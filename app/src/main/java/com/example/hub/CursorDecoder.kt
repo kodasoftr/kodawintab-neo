@@ -9,6 +9,8 @@ import android.graphics.Paint
 import android.graphics.Path
 import android.net.Uri
 import android.view.PointerIcon
+import java.io.ByteArrayOutputStream
+import java.io.InputStream
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import kotlin.math.roundToInt
@@ -92,13 +94,47 @@ object CursorDecoder {
         )
     }
 
+    private const val MAX_CURSOR_FILE_BYTES = 8 * 1024 * 1024
+
+    private fun readStreamBounded(stream: InputStream, maxBytes: Int = MAX_CURSOR_FILE_BYTES): ByteArray? {
+        val out = ByteArrayOutputStream()
+        val buf = ByteArray(8192)
+        var total = 0
+        while (true) {
+            val n = stream.read(buf)
+            if (n <= 0) break
+            total += n
+            if (total > maxBytes) return null
+            out.write(buf, 0, n)
+        }
+        return out.toByteArray()
+    }
+
+    private fun decodeSoftwareArgbBitmap(bytes: ByteArray): Bitmap? {
+        val opts = BitmapFactory.Options().apply {
+            inPreferredConfig = Bitmap.Config.ARGB_8888
+        }
+        val bmp = BitmapFactory.decodeByteArray(bytes, 0, bytes.size, opts) ?: return null
+        return if (bmp.config == Bitmap.Config.ARGB_8888) {
+            bmp
+        } else {
+            val copy = bmp.copy(Bitmap.Config.ARGB_8888, false)
+            if (copy != null && copy !== bmp) {
+                bmp.recycle()
+                copy
+            } else {
+                bmp
+            }
+        }
+    }
+
     fun decodeFromUri(context: Context, uri: Uri, displayName: String): DecodedCursor? {
-        val bytes = context.contentResolver.openInputStream(uri)?.use { it.readBytes() } ?: return null
+        val bytes = context.contentResolver.openInputStream(uri)?.use { readStreamBounded(it) } ?: return null
         return decodeBytes(bytes, displayName)
     }
 
     fun decodeFromUriWithBytes(context: Context, uri: Uri, displayName: String): Pair<DecodedCursor, ByteArray>? {
-        val bytes = context.contentResolver.openInputStream(uri)?.use { it.readBytes() } ?: return null
+        val bytes = context.contentResolver.openInputStream(uri)?.use { readStreamBounded(it) } ?: return null
         val decoded = decodeBytes(bytes, displayName) ?: return null
         return decoded to bytes
     }
@@ -108,7 +144,7 @@ object CursorDecoder {
 
         // 1. Direct PNG
         if (isPng(bytes)) {
-            val bmp = BitmapFactory.decodeByteArray(bytes, 0, bytes.size) ?: return null
+            val bmp = decodeSoftwareArgbBitmap(bytes) ?: return null
             val scaled = scaleCursorBitmapAspectPreserving(bmp)
             val (hx, hy) = detectAutoTipHotspot(scaled)
             return DecodedCursor(
@@ -136,7 +172,7 @@ object CursorDecoder {
         if (cur != null) return cur
 
         // 4. Generic BitmapFactory fallback
-        val fallbackBmp = BitmapFactory.decodeByteArray(bytes, 0, bytes.size) ?: return null
+        val fallbackBmp = decodeSoftwareArgbBitmap(bytes) ?: return null
         val scaled = scaleCursorBitmapAspectPreserving(fallbackBmp)
         val (hx, hy) = detectAutoTipHotspot(scaled)
         return DecodedCursor(
@@ -244,7 +280,7 @@ object CursorDecoder {
         val payload = bytes.copyOfRange(offset, offset + sizeInBytes)
 
         val decodedBmp = if (isPng(payload)) {
-            BitmapFactory.decodeByteArray(payload, 0, payload.size)
+            decodeSoftwareArgbBitmap(payload)
         } else {
             decodeDibBmpPayload(payload, w, h)
         } ?: return null
@@ -271,15 +307,16 @@ object CursorDecoder {
         if (payload.size < 40) return null
         val bb = ByteBuffer.wrap(payload).order(ByteOrder.LITTLE_ENDIAN)
         val headerSize = bb.getInt(0)
-        if (headerSize < 40) return null
-        val width = bb.getInt(4).takeIf { it > 0 } ?: expectedW
+        if (headerSize < 40 || headerSize > payload.size) return null
+        val width = bb.getInt(4).takeIf { it in 1..512 } ?: expectedW.coerceIn(1, 512)
         val totalHeight = bb.getInt(8)
-        val height = (totalHeight / 2).takeIf { it > 0 } ?: expectedH
+        val height = (totalHeight / 2).takeIf { it in 1..512 } ?: expectedH.coerceIn(1, 512)
         val bpp = bb.getShort(14).toInt() and 0xFFFF
+        if (bpp != 1 && bpp != 4 && bpp != 8 && bpp != 24 && bpp != 32) return null
         val colorsUsed = bb.getInt(32).let { raw ->
             when {
                 bpp >= 24 -> 0
-                raw > 0 -> raw
+                raw > 0 -> raw.coerceAtMost(256)
                 else -> 1 shl bpp
             }
         }

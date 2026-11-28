@@ -575,9 +575,13 @@ class ExampleRobolectricTest {
         composeTestRule.onNodeWithTag("home_mesa_button").performScrollTo().performClick()
         composeTestRule.waitForIdle()
 
-        val app = context.applicationContext as KodaWintabApp
+        composeTestRule.onNodeWithTag("otd_tab_tablet").assertIsDisplayed()
+
+        val app = composeTestRule.activity.application as KodaWintabApp
+        composeTestRule.onNodeWithTag("reset_tab_tablet_button").performScrollTo()
         composeTestRule.onNodeWithTag("open_fullscreen_calibration_button").performScrollTo().performClick()
         composeTestRule.waitForIdle()
+        composeTestRule.onNodeWithTag("calibration_factory_reset_button").assertIsDisplayed()
         assertTrue(app.cursorOverlayManager.isCalibrationSuppressed())
 
         composeTestRule.onNodeWithTag("calibration_back_button").performClick()

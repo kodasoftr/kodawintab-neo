@@ -20,6 +20,7 @@ import com.example.koda.engine.GlobalPointerSample
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.update
 import java.io.File
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.math.roundToInt
@@ -191,36 +192,42 @@ class CursorOverlayManager(private val context: Context) {
             KodaAccessibilityService.isEnabledInSettings(context)
         val granted = appOverlay || accessibilityWindowManager != null
         lastOverlayPermCheckMs = SystemClock.uptimeMillis()
-        val cur = _snapshot.value
-        if (cur.overlayPermissionGranted != granted || cur.accessibilityServiceEnabled != a11yRunning) {
-            _snapshot.value = cur.copy(
-                overlayPermissionGranted = granted,
-                accessibilityServiceEnabled = a11yRunning
-            )
+        _snapshot.update { cur ->
+            if (cur.overlayPermissionGranted != granted || cur.accessibilityServiceEnabled != a11yRunning) {
+                cur.copy(
+                    overlayPermissionGranted = granted,
+                    accessibilityServiceEnabled = a11yRunning
+                )
+            } else {
+                cur
+            }
         }
         forceImmediateOverlaySync()
     }
 
     fun setRenderMode(mode: CursorRenderMode) {
         prefs.edit().putString(KEY_RENDER_MODE, mode.name).apply()
-        _snapshot.value = _snapshot.value.copy(mode = mode)
+        _snapshot.update { it.copy(mode = mode) }
         forceImmediateOverlaySync()
     }
 
     fun setCursorScale(scale: Float) {
         val safe = scale.coerceIn(0.5f, 2.5f)
         prefs.edit().putFloat(KEY_CURSOR_SCALE, safe).apply()
-        _snapshot.value = _snapshot.value.copy(cursorScale = safe)
+        _snapshot.update { it.copy(cursorScale = safe) }
         forceImmediateOverlaySync()
     }
 
     fun setPaused(paused: Boolean) {
-        _snapshot.value = _snapshot.value.copy(isPaused = paused)
+        _snapshot.update { it.copy(isPaused = paused) }
+        if (!paused) {
+            restartAniTickerIfNeeded()
+        }
         forceImmediateOverlaySync()
     }
 
     fun setNativeHookApplied(applied: Boolean) {
-        _snapshot.value = _snapshot.value.copy(nativeCursorApplied = applied)
+        _snapshot.update { it.copy(nativeCursorApplied = applied) }
         forceImmediateOverlaySync()
     }
 
@@ -232,27 +239,26 @@ class CursorOverlayManager(private val context: Context) {
     }
 
     fun setChannelCursor(channel: Int, cursor: DecodedCursor?) {
-        val cur = _snapshot.value
-        val updated = if (channel == 2) {
-            val resolvedActive = if (cur.activeChannel == 2) (cursor ?: cur.channel1Cursor ?: builtInDefaultCursor) else (cur.channel1Cursor ?: cursor ?: builtInDefaultCursor)
-            cur.copy(
-                channel2Cursor = cursor,
-                activeCursor = resolvedActive,
-                currentChannel2FrameIndex = 0,
-                isChannel2Visible = cursor != null && cur.isChannel2Visible,
-                isVisible = resolvedActive != null || cur.isVisible
-            )
-        } else {
-            val effectiveCh1 = cursor ?: builtInDefaultCursor
-            val resolvedActive = effectiveCh1
-            cur.copy(
-                channel1Cursor = effectiveCh1,
-                activeCursor = resolvedActive,
-                currentFrameIndex = 0,
-                isVisible = true
-            )
+        _snapshot.update { cur ->
+            if (channel == 2) {
+                val resolvedActive = if (cur.activeChannel == 2) (cursor ?: cur.channel1Cursor ?: builtInDefaultCursor) else (cur.channel1Cursor ?: cursor ?: builtInDefaultCursor)
+                cur.copy(
+                    channel2Cursor = cursor,
+                    activeCursor = resolvedActive,
+                    currentChannel2FrameIndex = 0,
+                    isChannel2Visible = cursor != null && cur.isChannel2Visible,
+                    isVisible = true
+                )
+            } else {
+                val effectiveCh1 = cursor ?: builtInDefaultCursor
+                cur.copy(
+                    channel1Cursor = effectiveCh1,
+                    activeCursor = effectiveCh1,
+                    currentFrameIndex = 0,
+                    isVisible = true
+                )
+            }
         }
-        _snapshot.value = updated
         restartAniTickerIfNeeded()
         forceImmediateOverlaySync()
     }
@@ -327,46 +333,54 @@ class CursorOverlayManager(private val context: Context) {
                 lastTabletPipelineUpdateMs = now
             }
         }
-        val cur = _snapshot.value
-        val nextVisible = visible || (if (channel == 2) cur.channel2Cursor != null else cur.channel1Cursor != null)
-        if (channel == 2) {
-            if (cur.activeChannel == 2 &&
-                kotlin.math.abs(cur.cursor2X - x) < 0.25f &&
-                kotlin.math.abs(cur.cursor2Y - y) < 0.25f &&
-                cur.isChannel2Visible == nextVisible &&
-                cur.isFromTablet == fromTablet
-            ) {
-                return
+        var changed = false
+        _snapshot.update { cur ->
+            val nextVisible = visible || (if (channel == 2) cur.channel2Cursor != null else cur.channel1Cursor != null)
+            if (channel == 2) {
+                if (cur.activeChannel == 2 &&
+                    kotlin.math.abs(cur.cursor2X - x) < 0.25f &&
+                    kotlin.math.abs(cur.cursor2Y - y) < 0.25f &&
+                    cur.isChannel2Visible == nextVisible &&
+                    cur.isFromTablet == fromTablet
+                ) {
+                    cur
+                } else {
+                    changed = true
+                    val nextActive = cur.channel2Cursor ?: cur.channel1Cursor ?: cur.activeCursor
+                    cur.copy(
+                        activeChannel = 2,
+                        activeCursor = nextActive,
+                        cursor2X = x,
+                        cursor2Y = y,
+                        isChannel2Visible = nextVisible,
+                        isFromTablet = fromTablet
+                    )
+                }
+            } else {
+                if (cur.activeChannel == 1 &&
+                    kotlin.math.abs(cur.cursorX - x) < 0.25f &&
+                    kotlin.math.abs(cur.cursorY - y) < 0.25f &&
+                    cur.isVisible == nextVisible &&
+                    cur.isFromTablet == fromTablet
+                ) {
+                    cur
+                } else {
+                    changed = true
+                    val nextActive = cur.channel1Cursor ?: cur.channel2Cursor ?: cur.activeCursor
+                    cur.copy(
+                        activeChannel = 1,
+                        activeCursor = nextActive,
+                        cursorX = x,
+                        cursorY = y,
+                        isVisible = nextVisible,
+                        isFromTablet = fromTablet
+                    )
+                }
             }
-            val nextActive = cur.channel2Cursor ?: cur.channel1Cursor ?: cur.activeCursor
-            _snapshot.value = cur.copy(
-                activeChannel = 2,
-                activeCursor = nextActive,
-                cursor2X = x,
-                cursor2Y = y,
-                isChannel2Visible = nextVisible,
-                isFromTablet = fromTablet
-            )
-        } else {
-            if (cur.activeChannel == 1 &&
-                kotlin.math.abs(cur.cursorX - x) < 0.25f &&
-                kotlin.math.abs(cur.cursorY - y) < 0.25f &&
-                cur.isVisible == nextVisible &&
-                cur.isFromTablet == fromTablet
-            ) {
-                return
-            }
-            val nextActive = cur.channel1Cursor ?: cur.channel2Cursor ?: cur.activeCursor
-            _snapshot.value = cur.copy(
-                activeChannel = 1,
-                activeCursor = nextActive,
-                cursorX = x,
-                cursorY = y,
-                isVisible = nextVisible,
-                isFromTablet = fromTablet
-            )
         }
-        scheduleOverlaySync()
+        if (changed) {
+            scheduleOverlaySync()
+        }
     }
 
     @Volatile private var displayWidthPx = 1080f
@@ -386,20 +400,27 @@ class CursorOverlayManager(private val context: Context) {
         displayWidthPx = widthPx.coerceAtLeast(100f)
         displayHeightPx = heightPx.coerceAtLeast(100f)
         displayRotationDeg = ((rotationDeg % 360) + 360) % 360
-        val cur = _snapshot.value
-        val clampedX = cur.cursorX.coerceIn(0f, displayWidthPx)
-        val clampedY = cur.cursorY.coerceIn(0f, displayHeightPx)
-        val clamped2X = cur.cursor2X.coerceIn(0f, displayWidthPx)
-        val clamped2Y = cur.cursor2Y.coerceIn(0f, displayHeightPx)
-        if (clampedX != cur.cursorX || clampedY != cur.cursorY ||
-            clamped2X != cur.cursor2X || clamped2Y != cur.cursor2Y
-        ) {
-            _snapshot.value = cur.copy(
-                cursorX = clampedX,
-                cursorY = clampedY,
-                cursor2X = clamped2X,
-                cursor2Y = clamped2Y
-            )
+        var changed = false
+        _snapshot.update { cur ->
+            val clampedX = cur.cursorX.coerceIn(0f, displayWidthPx)
+            val clampedY = cur.cursorY.coerceIn(0f, displayHeightPx)
+            val clamped2X = cur.cursor2X.coerceIn(0f, displayWidthPx)
+            val clamped2Y = cur.cursor2Y.coerceIn(0f, displayHeightPx)
+            if (clampedX != cur.cursorX || clampedY != cur.cursorY ||
+                clamped2X != cur.cursor2X || clamped2Y != cur.cursor2Y
+            ) {
+                changed = true
+                cur.copy(
+                    cursorX = clampedX,
+                    cursorY = clampedY,
+                    cursor2X = clamped2X,
+                    cursor2Y = clamped2Y
+                )
+            } else {
+                cur
+            }
+        }
+        if (changed) {
             scheduleOverlaySync()
         }
     }
@@ -514,12 +535,14 @@ class CursorOverlayManager(private val context: Context) {
                 val count1 = cur.channel1Cursor?.frames?.size ?: 1
                 val count2 = cur.channel2Cursor?.frames?.size ?: 1
                 if (!cur.isPaused && (count1 > 1 || count2 > 1)) {
-                    val next1 = if (count1 > 1) (cur.currentFrameIndex + 1) % count1 else 0
-                    val next2 = if (count2 > 1) (cur.currentChannel2FrameIndex + 1) % count2 else 0
-                    _snapshot.value = cur.copy(
-                        currentFrameIndex = next1,
-                        currentChannel2FrameIndex = next2
-                    )
+                    _snapshot.update { s ->
+                        val c1 = s.channel1Cursor?.frames?.size ?: 1
+                        val c2 = s.channel2Cursor?.frames?.size ?: 1
+                        s.copy(
+                            currentFrameIndex = if (c1 > 1) (s.currentFrameIndex + 1) % c1 else 0,
+                            currentChannel2FrameIndex = if (c2 > 1) (s.currentChannel2FrameIndex + 1) % c2 else 0
+                        )
+                    }
                     overlayView1?.invalidate()
                     overlayView2?.invalidate()
                     applySystemOverlaysOnMain()
@@ -542,8 +565,8 @@ class CursorOverlayManager(private val context: Context) {
             val fresh = appPerm || a11yWm != null
             val a11yEnabled = a11yWm != null || KodaAccessibilityService.isEnabledInSettings(context)
             if (fresh != snap.overlayPermissionGranted || a11yEnabled != snap.accessibilityServiceEnabled) {
-                snap = snap.copy(overlayPermissionGranted = fresh, accessibilityServiceEnabled = a11yEnabled)
-                _snapshot.value = snap
+                _snapshot.update { it.copy(overlayPermissionGranted = fresh, accessibilityServiceEnabled = a11yEnabled) }
+                snap = _snapshot.value
             }
             fresh
         } else {
@@ -578,7 +601,7 @@ class CursorOverlayManager(private val context: Context) {
                     (snap.mode == CursorRenderMode.SIMULATED || showWin1 || showWin2)))
         if (lastHideDispatched != shouldHideNative) {
             lastHideDispatched = shouldHideNative
-            _snapshot.value = _snapshot.value.copy(nativePointerHidden = shouldHideNative)
+            _snapshot.update { it.copy(nativePointerHidden = shouldHideNative) }
             onNativePointerHideChanged?.invoke(shouldHideNative)
         }
 
@@ -683,6 +706,7 @@ class CursorOverlayManager(private val context: Context) {
             ).apply {
                 gravity = Gravity.TOP or Gravity.START
                 layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
+                alpha = if (windowType == WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY) 0.78f else 1.0f
                 this.x = winX
                 this.y = winY
                 title = windowTitle

@@ -18,6 +18,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 
 data class PenDisplayPreset(
@@ -76,6 +77,7 @@ class PenDisplayEngineManager(
     private var virtualDisplay: VirtualDisplay? = null
     private var presentation: KodasoftrDesktopPresentation? = null
     @Volatile private var prevPenDisplayTipDown = false
+    @Volatile var onResetToPrimaryDisplay: (() -> Unit)? = null
 
     init {
         scope.launch {
@@ -103,19 +105,21 @@ class PenDisplayEngineManager(
             String.format("%04X:%04X", profile.vendorId, pid)
         } else null
 
-        _state.value = current.copy(
-            isPenDisplayConnected = connected,
-            autoDetectedHardwareName = if (connected) (profile?.name ?: "Pen Display USB Detectada") else null,
-            autoDetectedVidPid = if (connected) vidPidStr else null,
-            selectedPreset = nextPreset,
-            statusMessage = if (connected) {
-                "Mesa com Tela Conectada: ${profile?.name ?: "USB Pen Display"}"
-            } else if (current.isVirtualDisplayActive) {
-                "Display Virtual Kodasoftr ativo (#${current.virtualDisplayId})"
-            } else {
-                "Pronto · Conecte uma Pen Display USB ou ative o Display Virtual Kodasoftr"
-            }
-        )
+        _state.update { cur ->
+            cur.copy(
+                isPenDisplayConnected = connected,
+                autoDetectedHardwareName = if (connected) (profile?.name ?: "Pen Display USB Detectada") else null,
+                autoDetectedVidPid = if (connected) vidPidStr else null,
+                selectedPreset = nextPreset,
+                statusMessage = if (connected) {
+                    "Mesa com Tela Conectada: ${profile?.name ?: "USB Pen Display"}"
+                } else if (cur.isVirtualDisplayActive) {
+                    "Display Virtual Kodasoftr ativo (#${cur.virtualDisplayId})"
+                } else {
+                    "Pronto · Conecte uma Pen Display USB ou ative o Display Virtual Kodasoftr"
+                }
+            )
+        }
 
         if (connected && !current.isVirtualDisplayActive) {
             startPenDisplaySession()
@@ -124,23 +128,27 @@ class PenDisplayEngineManager(
 
     fun setPenDisplayConnectedManual(enabled: Boolean) {
         if (enabled) {
-            _state.value = _state.value.copy(
-                isPenDisplayConnected = true,
-                autoDetectedHardwareName = _state.value.autoDetectedHardwareName ?: "Pen Display (Modo Ativo)"
-            )
+            _state.update {
+                it.copy(
+                    isPenDisplayConnected = true,
+                    autoDetectedHardwareName = it.autoDetectedHardwareName ?: "Pen Display (Modo Ativo)"
+                )
+            }
             startPenDisplaySession()
         } else {
             stopPenDisplaySession()
-            _state.value = _state.value.copy(
-                isPenDisplayConnected = false,
-                statusMessage = "Modo Mesa com Tela desativado"
-            )
+            _state.update {
+                it.copy(
+                    isPenDisplayConnected = false,
+                    statusMessage = "Modo Mesa com Tela desativado"
+                )
+            }
         }
     }
 
     fun selectPreset(preset: PenDisplayPreset) {
         val wasActive = _state.value.isVirtualDisplayActive
-        _state.value = _state.value.copy(selectedPreset = preset)
+        _state.update { it.copy(selectedPreset = preset) }
         if (wasActive) {
             startPenDisplaySession()
         }
@@ -161,12 +169,14 @@ class PenDisplayEngineManager(
 
         if (vd == null) {
             streamEngine.stop()
-            _state.value = _state.value.copy(
-                isVirtualDisplayActive = false,
-                isKodasoftrProjected = false,
-                virtualDisplayId = -1,
-                statusMessage = "Não foi possível criar VirtualDisplay neste dispositivo."
-            )
+            _state.update {
+                it.copy(
+                    isVirtualDisplayActive = false,
+                    isKodasoftrProjected = false,
+                    virtualDisplayId = -1,
+                    statusMessage = "Não foi possível criar VirtualDisplay neste dispositivo."
+                )
+            }
             return false
         }
 
@@ -174,7 +184,6 @@ class PenDisplayEngineManager(
         val disp = vd.display
         val dispId = disp?.displayId ?: -1
 
-        var projected = false
         if (disp != null) {
             scope.launch(Dispatchers.Main) {
                 runCatching {
@@ -192,8 +201,14 @@ class PenDisplayEngineManager(
                     )
                     pres.show()
                     presentation = pres
-                    projected = true
-                    _state.value = _state.value.copy(isKodasoftrProjected = true)
+                    _state.update { it.copy(isKodasoftrProjected = true) }
+                }.onFailure { err ->
+                    _state.update {
+                        it.copy(
+                            isKodasoftrProjected = false,
+                            statusMessage = "Display Virtual #$dispId ativo (falha na projeção: ${err.message ?: "erro"})"
+                        )
+                    }
                 }
             }
         }
@@ -204,13 +219,15 @@ class PenDisplayEngineManager(
             pipelineMesa1.config = pipelineMesa1.config.copy(targetDisplayId = dispId)
         }
 
-        _state.value = _state.value.copy(
-            isPenDisplayConnected = true,
-            isVirtualDisplayActive = true,
-            isKodasoftrProjected = projected || disp != null,
-            virtualDisplayId = dispId,
-            statusMessage = "Kodasoftr Desktop ativo no Display Virtual #$dispId (${preset.widthPx}×${preset.heightPx} · ${preset.dpi} DPI)"
-        )
+        _state.update {
+            it.copy(
+                isPenDisplayConnected = true,
+                isVirtualDisplayActive = true,
+                isKodasoftrProjected = false,
+                virtualDisplayId = dispId,
+                statusMessage = "Kodasoftr Desktop ativo no Display Virtual #$dispId (${preset.widthPx}×${preset.heightPx} · ${preset.dpi} DPI)"
+            )
+        }
         return true
     }
 
@@ -243,12 +260,15 @@ class PenDisplayEngineManager(
         displayManager.refreshDisplays()
         if (pipelineMesa1.config.targetDisplayId > 0) {
             pipelineMesa1.config = pipelineMesa1.config.copy(targetDisplayId = 0)
+            onResetToPrimaryDisplay?.invoke()
         }
-        _state.value = _state.value.copy(
-            isVirtualDisplayActive = false,
-            isKodasoftrProjected = false,
-            virtualDisplayId = -1
-        )
+        _state.update {
+            it.copy(
+                isVirtualDisplayActive = false,
+                isKodasoftrProjected = false,
+                virtualDisplayId = -1
+            )
+        }
     }
 
     fun toggleBoundApp(packageName: String) {
@@ -287,12 +307,14 @@ class PenDisplayEngineManager(
             !isTipDown && wasDown -> MotionEvent.ACTION_UP
             else -> MotionEvent.ACTION_HOVER_MOVE
         }
-        _state.value = st.copy(
-            lastStylusNormX = nx,
-            lastStylusNormY = ny,
-            lastStylusPressure = p,
-            lastStylusDown = isTipDown
-        )
+        _state.update {
+            it.copy(
+                lastStylusNormX = nx,
+                lastStylusNormY = ny,
+                lastStylusPressure = p,
+                lastStylusDown = isTipDown
+            )
+        }
         presentation?.updateStylusCursor(nx, ny, p, isTipDown)
 
         if (injectSystemEvent && st.virtualDisplayId > 0 && engineClient.state.value.isActive) {

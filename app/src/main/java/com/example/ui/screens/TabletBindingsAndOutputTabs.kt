@@ -916,7 +916,9 @@ fun OutputTab(
                 }
                 displays.forEach { disp ->
                     Row(
-                        modifier = Modifier.fillMaxWidth(),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clickable { onUpdateConfig { it.copy(targetDisplayId = disp.displayId) } },
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         RadioButton(

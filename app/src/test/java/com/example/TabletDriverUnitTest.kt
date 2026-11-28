@@ -552,7 +552,287 @@ class TabletDriverUnitTest {
         assertTrue(report.isEraser)
         assertTrue(report.isTipDown)
     }
+
+    @Test
+    fun `ugee and xp-pen pen strokes are not flagged as eraser and 0x00 idle exits hover cleanly`() {
+        val report = TabletReport()
+        val ugee = UgeeS640Parser()
+        val xppen = com.example.driver.XpPenParser()
+
+        for (parser in listOf(ugee, xppen)) {
+            // Normal hover (0xA0) and normal pen strokes (0xA1, 0xA3) must have isEraser == false
+            val hoverPkt = byteArrayOf(0x02, 0xA0.toByte(), 0x10, 0x20, 0x30, 0x40, 0x00, 0x00, 10, (-5).toByte())
+            assertTrue(parser.parse(hoverPkt, hoverPkt.size, report))
+            assertTrue(report.isHovering)
+            assertFalse(report.isTipDown)
+            assertFalse(report.isEraser)
+
+            val drawPkt = byteArrayOf(0x02, 0xA1.toByte(), 0x10, 0x20, 0x30, 0x40, 0x00, 0x10, 18, (-20).toByte())
+            assertTrue(parser.parse(drawPkt, drawPkt.size, report))
+            assertTrue(report.isTipDown)
+            assertFalse(report.isEraser)
+            assertEquals(4096, report.rawPressure)
+            assertEquals(18f, report.tiltXDeg, 0.01f)
+            assertEquals(-20f, report.tiltYDeg, 0.01f)
+
+            // Barrel button + tip down (0xA3) is still TOOL_TYPE_STYLUS, not eraser
+            val barrelDrawPkt = byteArrayOf(0x08, 0xA3.toByte(), 0x10, 0x20, 0x30, 0x40, 0xFF.toByte(), 0x1F)
+            assertTrue(parser.parse(barrelDrawPkt, barrelDrawPkt.size, report))
+            assertTrue(report.isTipDown)
+            assertTrue(report.barrelButton1)
+            assertFalse(report.isEraser)
+
+            // Actual eraser bit 0x08 (0xA9 = in-range + tip + eraser) sets isEraser == true
+            val eraserPkt = byteArrayOf(0x02, 0xA9.toByte(), 0x10, 0x20, 0x30, 0x40, 0x00, 0x08)
+            assertTrue(parser.parse(eraserPkt, eraserPkt.size, report))
+            assertTrue(report.isTipDown)
+            assertTrue(report.isEraser)
+
+            // Pen lifted out of magnetic range (status 0x00, zero pressure) exits hover
+            val idlePkt = byteArrayOf(0x02, 0x00, 0x10, 0x20, 0x30, 0x40, 0x00, 0x00)
+            assertTrue(parser.parse(idlePkt, idlePkt.size, report))
+            assertFalse(report.isHovering)
+            assertFalse(report.isTipDown)
+        }
+    }
+
+    @Test
+    fun `huion 10-byte tilt does not corrupt 16-bit xy coordinates and pipeline rotates tilt with screen`() {
+        val report = TabletReport()
+        val huion = HuionParser(maxX = 50800, maxY = 31750, maxPressure = 8191)
+        val huion10 = byteArrayOf(0x08, 0x81.toByte(), 0x34, 0x12, 0x78, 0x56, 0xAA.toByte(), 0x0F, 25, (-15).toByte())
+        assertTrue(huion.parse(huion10, huion10.size, report))
+        assertEquals(0x1234, report.rawX)
+        assertEquals(0x5678, report.rawY)
+        assertEquals(0x0FAA, report.rawPressure)
+        assertEquals(25f, report.tiltXDeg, 0.01f)
+        assertEquals(-15f, report.tiltYDeg, 0.01f)
+
+        val wacom = WacomParser()
+        val wacom12 = byteArrayOf(0x10, 0xA1.toByte(), 0x10, 0x08, 0x20, 0x04, 0xFF.toByte(), 0x07, 0x00, 0x00, (-10).toByte(), 22)
+        assertTrue(wacom.parse(wacom12, wacom12.size, report))
+        assertEquals(-10f, report.tiltXDeg, 0.01f)
+        assertEquals(22f, report.tiltYDeg, 0.01f)
+
+        val rotatedTilt = FloatArray(2)
+        com.example.driver.TabletPipeline.transformTilt(10f, -20f, rotationDeg = 90, invertX = false, invertY = false, outXY = rotatedTilt)
+        assertEquals(20f, rotatedTilt[0], 0.01f)
+        assertEquals(10f, rotatedTilt[1], 0.01f)
+
+        com.example.driver.TabletPipeline.transformTilt(10f, -20f, rotationDeg = 180, invertX = false, invertY = false, outXY = rotatedTilt)
+        assertEquals(-10f, rotatedTilt[0], 0.01f)
+        assertEquals(20f, rotatedTilt[1], 0.01f)
+    }
+
+    @Test
+    fun `zero alloc ring buffer supports concurrent multi-producer offers without losing integrity`() {
+        val ring = ZeroAllocRingBuffer(capacity = 64, packetSize = 12)
+        val totalPerThread = 200
+        val t1 = Thread {
+            val pkt = ByteArray(10)
+            for (i in 0 until totalPerThread) {
+                pkt[0] = 1
+                pkt[1] = (i and 0x7F).toByte()
+                while (!ring.offer(pkt, 10, i.toLong())) {
+                    Thread.yield()
+                }
+            }
+        }
+        val t2 = Thread {
+            val pkt = ByteArray(10)
+            for (i in 0 until totalPerThread) {
+                pkt[0] = 2
+                pkt[1] = (i and 0x7F).toByte()
+                while (!ring.offer(pkt, 10, i.toLong())) {
+                    Thread.yield()
+                }
+            }
+        }
+        t1.start()
+        t2.start()
+
+        val out = ByteArray(12)
+        val meta = LongArray(1)
+        var count1 = 0
+        var count2 = 0
+        val deadline = System.currentTimeMillis() + 3000L
+        while (count1 + count2 < totalPerThread * 2 && System.currentTimeMillis() < deadline) {
+            val len = ring.poll(out, meta)
+            if (len == 10) {
+                if (out[0].toInt() == 1) count1++
+                else if (out[0].toInt() == 2) count2++
+            } else {
+                Thread.yield()
+            }
+        }
+        t1.join(1000L)
+        t2.join(1000L)
+        assertEquals(totalPerThread, count1)
+        assertEquals(totalPerThread, count2)
+    }
+
+    @Test
+    fun `veikk parser decodes 0x40 legacy and 0xA0 modern stylus reports plus 0xC0 exit and express keys`() {
+        val report = TabletReport()
+        val veikk = com.example.driver.VeikkParser()
+
+        // 1. Legacy Veikk S640/A30 in-range tip down (0x41)
+        val legacyDraw = byteArrayOf(0x01, 0x41, 0x34, 0x12, 0x78, 0x56, 0xFF.toByte(), 0x0F)
+        assertTrue(veikk.parse(legacyDraw, legacyDraw.size, report))
+        assertTrue(report.isHovering)
+        assertTrue(report.isTipDown)
+        assertFalse(report.isEraser)
+        assertEquals(0x1234, report.rawX)
+        assertEquals(0x5678, report.rawY)
+        assertEquals(4095, report.rawPressure)
+
+        // 2. Modern Veikk 0xA3 (in-range + tip + barrel1): bit 5 (0x20) is NOT eraser
+        val modernDraw = byteArrayOf(0x08, 0xA3.toByte(), 0x10, 0x20, 0x30, 0x40, 0xFF.toByte(), 0x1F, 14, (-9).toByte())
+        assertTrue(veikk.parse(modernDraw, modernDraw.size, report))
+        assertTrue(report.isHovering)
+        assertTrue(report.isTipDown)
+        assertTrue(report.barrelButton1)
+        assertFalse(report.isEraser)
+        assertEquals(8191, report.rawPressure)
+        assertEquals(14f, report.tiltXDeg, 0.01f)
+        assertEquals(-9f, report.tiltYDeg, 0.01f)
+
+        // 3. Out of range 0xC0 exits hover cleanly
+        val outOfRange = byteArrayOf(0x08, 0xC0.toByte(), 0x10, 0x20, 0x30, 0x40, 0x00, 0x00)
+        assertTrue(veikk.parse(outOfRange, outOfRange.size, report))
+        assertFalse(report.isHovering)
+        assertFalse(report.isTipDown)
+
+        // 4. Express key report 0x03 flags isExpressKeyFrame without affecting coordinates
+        val expKey = byteArrayOf(0x03, 0x01, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00)
+        assertTrue(veikk.parse(expKey, expKey.size, report))
+        assertTrue(report.isExpressKeyFrame)
+        assertEquals(0x0004, report.expressKeyMask)
+    }
+
+    @Test
+    fun `huion 0xC0 exits hover cleanly and uclogic bit5IsEraser false treats 0xA1 as normal stylus`() {
+        val report = TabletReport()
+        val huion = HuionParser()
+
+        // 0xC0 means out-of-range on Huion/UC-Logic and must NOT keep hover stuck
+        val huionOut = byteArrayOf(0x08, 0xC0.toByte(), 0x10, 0x20, 0x30, 0x40, 0x00, 0x00)
+        assertTrue(huion.parse(huionOut, huionOut.size, report))
+        assertFalse(report.isHovering)
+        assertFalse(report.isTipDown)
+
+        // UC-Logic / Gaomon / Parblo mode (bit5IsEraser = false)
+        val ucLogic = HuionParser(
+            maxX = 40000,
+            maxY = 25000,
+            maxPressure = 8191,
+            bit5IsEraser = false,
+            brand = com.example.driver.TabletBrand.UCLOGIC
+        )
+        val ucDraw = byteArrayOf(0x08, 0xA1.toByte(), 0x20, 0x4E, 0x10, 0x27, 0xFF.toByte(), 0x1F)
+        assertTrue(ucLogic.parse(ucDraw, ucDraw.size, report))
+        assertTrue(report.isHovering)
+        assertTrue(report.isTipDown)
+        assertFalse(report.isEraser)
+        assertEquals(20000, report.rawX)
+        assertEquals(10000, report.rawY)
+        assertEquals(8191, report.rawPressure)
+
+        val ucEraser = byteArrayOf(0x08, 0xA9.toByte(), 0x20, 0x4E, 0x10, 0x27, 0x00, 0x10)
+        assertTrue(ucLogic.parse(ucEraser, ucEraser.size, report))
+        assertTrue(report.isTipDown)
+        assertTrue(report.isEraser)
+    }
+
+    @Test
+    fun `resilient parser ignores mid-stroke auxiliary packets instead of dropping tip down`() {
+        val report = TabletReport()
+        val resilient = com.example.driver.ResilientTabletParser(
+            primary = UgeeS640Parser(),
+            fallbacks = listOf(HuionParser(), com.example.driver.GenericHidDigitizerParser())
+        )
+
+        // Establish confirmed non-generic stylus stroke
+        val drawPkt = byteArrayOf(0x02, 0xA1.toByte(), 0x20, 0x10, 0x40, 0x20, 0x00, 0x10)
+        assertTrue(resilient.parse(drawPkt, drawPkt.size, report))
+        assertTrue(report.isTipDown)
+
+        // Unrecognized short/auxiliary vendor packet (e.g., reportId 0x04 battery/wheel status)
+        // must be rejected (return false) rather than parsed as 0-pressure UP by GenericHidDigitizerParser
+        val auxPkt = byteArrayOf(0x04, 0x01, 0x02, 0x03, 0x00, 0x00, 0x00, 0x00)
+        assertFalse(resilient.parse(auxPkt, auxPkt.size, report))
+    }
+
+    @Test
+    fun `hid descriptor decoder extracts digitizer usage page and 16bit and 32bit logical max bounds`() {
+        // Minimal HID Report Descriptor:
+        // Usage Page (Digitizer 0x0D), Usage (Generic Desktop 0x01), Usage X (0x30) LogMax 50800 (16-bit),
+        // Usage Y (0x31) LogMax 31750 (16-bit), Usage Page (Digitizer 0x0D), Usage Tip Pressure (0x30) LogMax 16383 (32-bit)
+        val desc = byteArrayOf(
+            0x05, 0x0D,                   // Usage Page (Digitizer)
+            0x05, 0x01,                   // Usage Page (Generic Desktop)
+            0x09, 0x30,                   // Usage (X)
+            0x26, 0x70, 0xC6.toByte(),    // Logical Maximum (50800)
+            0x09, 0x31,                   // Usage (Y)
+            0x26, 0x06, 0x7C,             // Logical Maximum (31750)
+            0x05, 0x0D,                   // Usage Page (Digitizer)
+            0x09, 0x30,                   // Usage (Tip Pressure)
+            0x27, 0xFF.toByte(), 0x3F, 0x00, 0x00 // Logical Maximum (16383)
+        )
+        val layout = com.example.driver.HidDescriptorDecoder.decode(desc)
+        assertTrue(layout.hasDigitizerUsagePage)
+        assertEquals(50800, layout.logicalMaxX)
+        assertEquals(31750, layout.logicalMaxY)
+        assertEquals(16383, layout.logicalMaxPressure)
+    }
+
+    @Test
+    fun `mouse hid parser preserves 8bit dy negative one slow drag without 16bit false positive`() {
+        val parser = com.example.usb.MouseHidParser()
+        // 6-byte standard 8-bit mouse packet: [buttons=0x00, dx=+5, dy=-1 (0xFF), wheel=0, extra=0, extra=0]
+        val pkt8 = byteArrayOf(0x00, 5, (-1).toByte(), 0, 0, 0)
+        assertTrue(parser.parse(pkt8, pkt8.size, sensitivity = 1.0f))
+        assertEquals(5f, parser.deltaX, 0.01f)
+        assertEquals(-1f, parser.deltaY, 0.01f)
+
+        // True 6-byte 16-bit LE packet with sign-extended negative X and Y: [btn=0, xLo=-10, xHi=-1, yLo=-5, yHi=-1, wheel=0]
+        val pkt16 = byteArrayOf(0x00, (-10).toByte(), (-1).toByte(), (-5).toByte(), (-1).toByte(), 0)
+        assertTrue(parser.parse(pkt16, pkt16.size, sensitivity = 1.0f))
+        assertEquals(-10f, parser.deltaX, 0.01f)
+        assertEquals(-5f, parser.deltaY, 0.01f)
+    }
+
+    @Test
+    fun `ring buffer clear and tiny coordinate matrix bounds remain safe without NaN`() {
+        val ring = ZeroAllocRingBuffer(capacity = 4, packetSize = 8)
+        assertTrue(ring.offer(byteArrayOf(9, 8, 7), 3, 55L))
+        ring.clear()
+        val out = ByteArray(8)
+        val meta = LongArray(1)
+        assertEquals(-1, ring.poll(out, meta))
+
+        val matrix = CoordinateMatrix()
+        matrix.rebuild(
+            tabletMaxX = 0,
+            tabletMaxY = 0,
+            activeArea = ActiveAreaRect(0f, 0f, 0f, 0f),
+            screenArea = ActiveAreaRect(0f, 0f, 1f, 1f),
+            displayWidthPx = 0f,
+            displayHeightPx = 0f,
+            manualRotationDeg = 0,
+            autoRotation = false,
+            displayRotationDeg = 0,
+            invertX = false,
+            invertY = false,
+            dpiMode = com.example.driver.DpiNormalizationMode.AUTO,
+            targetDpiX = 0f,
+            targetDpiY = 0f,
+            tabletWidthMm = 0f,
+            tabletHeightMm = 0f
+        )
+        val xy = FloatArray(2)
+        matrix.transform(100f, 200f, xy)
+        assertFalse(xy[0].isNaN())
+        assertFalse(xy[1].isNaN())
+    }
 }
-
-
-

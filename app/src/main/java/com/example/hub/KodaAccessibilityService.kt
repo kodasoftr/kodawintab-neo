@@ -28,15 +28,17 @@ class KodaAccessibilityService : AccessibilityService() {
     private val gestureLock = Any()
     private var dragOngoing = false
     private var gestureInFlight = false
+    private var activeGestureGeneration = 0L
     private var lastStrokeX = 0f
     private var lastStrokeY = 0f
-    private var hasPendingMove = false
-    private var pendingMoveX = 0f
-    private var pendingMoveY = 0f
+    private val pendingMoveXs = FloatArray(16)
+    private val pendingMoveYs = FloatArray(16)
+    private var pendingMoveCount = 0
     private var pendingUp = false
     private var pendingUpX = 0f
     private var pendingUpY = 0f
     private var activeContinuation: GestureDescription.StrokeDescription? = null
+    private var lastGestureDispatchMs = 0L
 
     override fun onServiceConnected() {
         super.onServiceConnected()
@@ -61,9 +63,10 @@ class KodaAccessibilityService : AccessibilityService() {
 
     override fun onDestroy() {
         synchronized(gestureLock) {
+            activeGestureGeneration++
             dragOngoing = false
             gestureInFlight = false
-            hasPendingMove = false
+            pendingMoveCount = 0
             pendingUp = false
             activeContinuation = null
         }
@@ -86,19 +89,26 @@ class KodaAccessibilityService : AccessibilityService() {
         val sx = x.coerceAtLeast(1f)
         val sy = y.coerceAtLeast(1f)
         synchronized(gestureLock) {
+            val nowMs = android.os.SystemClock.uptimeMillis()
+            if (gestureInFlight && nowMs - lastGestureDispatchMs > 650L) {
+                gestureInFlight = false
+                dragOngoing = false
+                activeContinuation = null
+            }
             lastStrokeX = sx
             lastStrokeY = sy
-            hasPendingMove = false
+            pendingMoveCount = 0
             pendingUp = false
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                 val path = Path().apply {
                     moveTo(sx, sy)
-                    lineTo(sx + 0.25f, sy + 0.25f)
+                    lineTo(sx + 0.35f, sy + 0.35f)
                 }
-                val stroke = GestureDescription.StrokeDescription(path, 0L, 18L, true)
+                val stroke = GestureDescription.StrokeDescription(path, 0L, 14L, true)
                 activeContinuation = stroke
                 dragOngoing = true
                 gestureInFlight = true
+                lastGestureDispatchMs = nowMs
                 dispatchGestureLocked(GestureDescription.Builder().addStroke(stroke).build())
             } else {
                 dragOngoing = true
@@ -111,9 +121,23 @@ class KodaAccessibilityService : AccessibilityService() {
         val sy = y.coerceAtLeast(1f)
         synchronized(gestureLock) {
             if (!dragOngoing) return
-            pendingMoveX = sx
-            pendingMoveY = sy
-            hasPendingMove = true
+            val nowMs = android.os.SystemClock.uptimeMillis()
+            if (gestureInFlight && nowMs - lastGestureDispatchMs > 650L) {
+                gestureInFlight = false
+            }
+            val refX = if (pendingMoveCount > 0) pendingMoveXs[pendingMoveCount - 1] else lastStrokeX
+            val refY = if (pendingMoveCount > 0) pendingMoveYs[pendingMoveCount - 1] else lastStrokeY
+            if (kotlin.math.hypot(sx - refX, sy - refY) < 0.5f) {
+                return
+            }
+            if (pendingMoveCount < pendingMoveXs.size) {
+                pendingMoveXs[pendingMoveCount] = sx
+                pendingMoveYs[pendingMoveCount] = sy
+                pendingMoveCount++
+            } else {
+                pendingMoveXs[pendingMoveXs.size - 1] = sx
+                pendingMoveYs[pendingMoveYs.size - 1] = sy
+            }
             if (!gestureInFlight && Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                 flushPendingLocked()
             }
@@ -134,10 +158,80 @@ class KodaAccessibilityService : AccessibilityService() {
                 } else {
                     dragOngoing = false
                     pendingUp = false
+                    pendingMoveCount = 0
                     dispatchTapLocked(sx, sy)
                 }
             }
         }
+    }
+
+    fun cancelActiveStroke() {
+        var releaseX = 0f
+        var releaseY = 0f
+        var shouldRelease = false
+        synchronized(gestureLock) {
+            if (!dragOngoing) {
+                pendingMoveCount = 0
+                pendingUp = false
+                return
+            }
+            releaseX = lastStrokeX.coerceAtLeast(1f)
+            releaseY = lastStrokeY.coerceAtLeast(1f)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && activeContinuation != null && !gestureInFlight) {
+                pendingUp = true
+                pendingUpX = releaseX
+                pendingUpY = releaseY
+                flushPendingLocked()
+            } else {
+                activeGestureGeneration++
+                dragOngoing = false
+                gestureInFlight = false
+                pendingMoveCount = 0
+                pendingUp = false
+                activeContinuation = null
+                shouldRelease = true
+            }
+        }
+        if (shouldRelease && Build.VERSION.SDK_INT < Build.VERSION_CODES.O) {
+            // No continuation API below O
+        }
+    }
+
+    private fun buildBatchedPath(
+        startX: Float,
+        startY: Float,
+        endX: Float?,
+        endY: Float?
+    ): Pair<Path, Pair<Float, Float>> {
+        val path = Path().apply { moveTo(startX, startY) }
+        var curX = startX
+        var curY = startY
+        var totalDist = 0f
+        for (i in 0 until pendingMoveCount) {
+            val nx = pendingMoveXs[i]
+            val ny = pendingMoveYs[i]
+            totalDist += kotlin.math.hypot(nx - curX, ny - curY)
+            path.lineTo(nx, ny)
+            curX = nx
+            curY = ny
+        }
+        if (endX != null && endY != null) {
+            totalDist += kotlin.math.hypot(endX - curX, endY - curY)
+            if (totalDist < 0.35f) {
+                curX += 0.35f
+                curY += 0.35f
+                path.lineTo(curX, curY)
+            } else {
+                path.lineTo(endX, endY)
+                curX = endX
+                curY = endY
+            }
+        } else if (totalDist < 0.35f) {
+            curX += 0.35f
+            curY += 0.35f
+            path.lineTo(curX, curY)
+        }
+        return path to (curX to curY)
     }
 
     private fun flushPendingLocked() {
@@ -145,43 +239,38 @@ class KodaAccessibilityService : AccessibilityService() {
         val prev = activeContinuation ?: run {
             dragOngoing = false
             pendingUp = false
-            hasPendingMove = false
+            pendingMoveCount = 0
             return
         }
         if (pendingUp) {
             val ux = pendingUpX
             val uy = pendingUpY
+            val (path, _) = buildBatchedPath(lastStrokeX, lastStrokeY, ux, uy)
             pendingUp = false
-            hasPendingMove = false
+            pendingMoveCount = 0
             dragOngoing = false
             activeContinuation = null
-            val path = Path().apply {
-                moveTo(lastStrokeX, lastStrokeY)
-                lineTo(ux, uy)
-            }
-            val finalStroke = runCatching { prev.continueStroke(path, 0L, 12L, false) }.getOrNull()
+            val finalStroke = runCatching { prev.continueStroke(path, 0L, 10L, false) }.getOrNull()
             if (finalStroke != null) {
                 gestureInFlight = true
+                lastGestureDispatchMs = android.os.SystemClock.uptimeMillis()
                 dispatchGestureLocked(GestureDescription.Builder().addStroke(finalStroke).build())
             } else {
                 gestureInFlight = false
             }
             return
         }
-        if (hasPendingMove && dragOngoing) {
-            val mx = pendingMoveX
-            val my = pendingMoveY
-            hasPendingMove = false
-            val path = Path().apply {
-                moveTo(lastStrokeX, lastStrokeY)
-                lineTo(mx, my)
-            }
-            val contStroke = runCatching { prev.continueStroke(path, 0L, 16L, true) }.getOrNull()
+        if (pendingMoveCount > 0 && dragOngoing) {
+            val durationMs = (pendingMoveCount * 6L).coerceIn(10L, 26L)
+            val (path, endPt) = buildBatchedPath(lastStrokeX, lastStrokeY, null, null)
+            pendingMoveCount = 0
+            val contStroke = runCatching { prev.continueStroke(path, 0L, durationMs, true) }.getOrNull()
             if (contStroke != null) {
                 activeContinuation = contStroke
-                lastStrokeX = mx
-                lastStrokeY = my
+                lastStrokeX = endPt.first
+                lastStrokeY = endPt.second
                 gestureInFlight = true
+                lastGestureDispatchMs = android.os.SystemClock.uptimeMillis()
                 dispatchGestureLocked(GestureDescription.Builder().addStroke(contStroke).build())
             } else {
                 activeContinuation = null
@@ -205,8 +294,9 @@ class KodaAccessibilityService : AccessibilityService() {
             moveTo(sx, sy)
             lineTo(sx + 0.5f, sy + 0.5f)
         }
-        val stroke = GestureDescription.StrokeDescription(path, 0L, 28L)
+        val stroke = GestureDescription.StrokeDescription(path, 0L, 24L)
         gestureInFlight = true
+        lastGestureDispatchMs = android.os.SystemClock.uptimeMillis()
         dispatchGestureLocked(GestureDescription.Builder().addStroke(stroke).build())
     }
 
@@ -224,6 +314,7 @@ class KodaAccessibilityService : AccessibilityService() {
             }
             val stroke = GestureDescription.StrokeDescription(path, 0L, 120L)
             gestureInFlight = true
+            lastGestureDispatchMs = android.os.SystemClock.uptimeMillis()
             dispatchGestureLocked(GestureDescription.Builder().addStroke(stroke).build())
         }
     }
@@ -233,14 +324,17 @@ class KodaAccessibilityService : AccessibilityService() {
     fun performSystemHome(): Boolean = performGlobalAction(GLOBAL_ACTION_HOME)
 
     private fun dispatchGestureLocked(gesture: GestureDescription) {
+        activeGestureGeneration++
+        val gen = activeGestureGeneration
         val dispatched = runCatching {
             dispatchGesture(
                 gesture,
                 object : GestureResultCallback() {
                     override fun onCompleted(gestureDescription: GestureDescription?) {
                         synchronized(gestureLock) {
+                            if (gen != activeGestureGeneration) return
                             gestureInFlight = false
-                            if (pendingUp || (hasPendingMove && dragOngoing)) {
+                            if (pendingUp || (pendingMoveCount > 0 && dragOngoing)) {
                                 flushPendingLocked()
                             }
                         }
@@ -248,9 +342,10 @@ class KodaAccessibilityService : AccessibilityService() {
 
                     override fun onCancelled(gestureDescription: GestureDescription?) {
                         synchronized(gestureLock) {
+                            if (gen != activeGestureGeneration) return
                             gestureInFlight = false
                             dragOngoing = false
-                            hasPendingMove = false
+                            pendingMoveCount = 0
                             pendingUp = false
                             activeContinuation = null
                         }
@@ -263,7 +358,7 @@ class KodaAccessibilityService : AccessibilityService() {
         if (!dispatched) {
             gestureInFlight = false
             dragOngoing = false
-            hasPendingMove = false
+            pendingMoveCount = 0
             pendingUp = false
             activeContinuation = null
         }

@@ -7,6 +7,8 @@ enum class ParserType {
     WACOM,
     HUION,
     XP_PEN,
+    VEIKK,
+    UCLOGIC,
     GENERIC_HID
 }
 
@@ -15,6 +17,8 @@ enum class TabletBrand(val displayName: String) {
     WACOM("Wacom"),
     HUION("Huion"),
     XP_PEN("XP-Pen"),
+    VEIKK("Veikk"),
+    UCLOGIC("UC-Logic / Gaomon / Parblo"),
     GENERIC("HID Genérico")
 }
 

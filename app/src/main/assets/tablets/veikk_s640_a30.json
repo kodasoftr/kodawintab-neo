@@ -1,0 +1,28 @@
+{
+  "id": "veikk_s640_a30",
+  "name": "Veikk S640 / A30 / VK",
+  "brand": "Veikk",
+  "vendorId": 12267,
+  "productIds": [1, 2, 3, 4, 16, 17, 18, 19, 32, 4097, 4098],
+  "widthMm": 152.4,
+  "heightMm": 101.6,
+  "maxX": 32767,
+  "maxY": 32767,
+  "maxPressure": 8191,
+  "lpi": 5080,
+  "pollingRateHz": 250,
+  "interfaceNumber": 0,
+  "endpointAddress": 129,
+  "parserType": "VEIKK",
+  "initControlTransfers": [
+    {
+      "requestType": 33,
+      "request": 9,
+      "value": 777,
+      "index": 0,
+      "dataHex": "09010000"
+    }
+  ],
+  "expressKeysCount": 4,
+  "supportsTilt": true
+}

@@ -1,7 +1,5 @@
 package com.example.driver
 
-import kotlin.math.min
-
 /**
  * Pre-calculated 2x3 affine transformation matrix for sub-pixel coordinate mapping.
  *
@@ -89,10 +87,12 @@ class CoordinateMatrix {
         effectiveRotationDeg = totalRot
 
         // Compute target screen bounds
-        val sw = (screenArea.widthNorm.coerceIn(0.05f, 1f)) * displayWidthPx
-        val sh = (screenArea.heightNorm.coerceIn(0.05f, 1f)) * displayHeightPx
-        val screenX = (screenArea.leftNorm.coerceIn(0f, 0.95f)) * displayWidthPx
-        val screenY = (screenArea.topNorm.coerceIn(0f, 0.95f)) * displayHeightPx
+        val safeDispW = displayWidthPx.coerceAtLeast(1f)
+        val safeDispH = displayHeightPx.coerceAtLeast(1f)
+        val sw = (screenArea.widthNorm.coerceIn(0.05f, 1f)) * safeDispW
+        val sh = (screenArea.heightNorm.coerceIn(0.05f, 1f)) * safeDispH
+        val screenX = (screenArea.leftNorm.coerceIn(0f, 0.95f)) * safeDispW
+        val screenY = (screenArea.topNorm.coerceIn(0f, 0.95f)) * safeDispH
 
         val fullTabW = tabletWidthMm.coerceAtLeast(10f)
         val fullTabH = tabletHeightMm.coerceAtLeast(10f)
@@ -109,30 +109,26 @@ class CoordinateMatrix {
                 // sideways never stretches active area across full width and never feels heavy.
                 val maxScreenPx = maxOf(sw, sh)
                 val minScreenPx = minOf(sw, sh)
-                val maxTabMm = maxOf(effTabW, effTabH)
-                val minTabMm = minOf(effTabW, effTabH)
-                val baselinePxPerMm = min(maxScreenPx / minTabMm, minScreenPx / minTabMm.coerceAtLeast(1f))
-                    .let {
-                        // Prefer crisp isotropic fit: fit longest screen axis onto min tablet side when possible
-                        val portraitDensity = maxScreenPx / minTabMm
-                        val landscapeDensity = maxScreenPx / maxTabMm
-                        // If portrait density fits both orientations nicely inside physical tablet bounds, use it!
-                        if (minScreenPx / portraitDensity <= minTabMm && maxScreenPx / portraitDensity <= maxTabMm) {
-                            portraitDensity
-                        } else {
-                            // Fit within physical tablet while preserving 1:1 ratio and boosting small side
-                            maxOf(portraitDensity.coerceAtMost(maxScreenPx / minTabMm), landscapeDensity)
-                        }
-                    }
+                val maxTabMm = maxOf(effTabW, effTabH).coerceAtLeast(1f)
+                val minTabMm = minOf(effTabW, effTabH).coerceAtLeast(1f)
+                val portraitDensity = maxScreenPx / minTabMm
+                val landscapeDensity = maxScreenPx / maxTabMm
+                val baselinePxPerMm = if (minScreenPx / portraitDensity <= minTabMm &&
+                    maxScreenPx / portraitDensity <= maxTabMm
+                ) {
+                    portraitDensity
+                } else {
+                    maxOf(portraitDensity.coerceAtMost(maxScreenPx / minTabMm), landscapeDensity)
+                }.coerceAtLeast(0.1f)
 
-                var targetW = sw / baselinePxPerMm
-                var targetH = sh / baselinePxPerMm
+                var targetW = (sw / baselinePxPerMm).coerceAtLeast(1f)
+                var targetH = (sh / baselinePxPerMm).coerceAtLeast(1f)
                 val fitScale = minOf(effTabW / targetW, effTabH / targetH, 1f)
                 targetW *= fitScale
                 targetH *= fitScale
 
-                val newAw = if (!rotatedIsSideways) (targetW / fullTabW).coerceIn(0.12f, aw) else (targetH / fullTabW).coerceIn(0.12f, aw)
-                val newAh = if (!rotatedIsSideways) (targetH / fullTabH).coerceIn(0.12f, ah) else (targetW / fullTabH).coerceIn(0.12f, ah)
+                val newAw = if (!rotatedIsSideways) (targetW / fullTabW).coerceIn(minOf(0.12f, aw), aw) else (targetH / fullTabW).coerceIn(minOf(0.12f, aw), aw)
+                val newAh = if (!rotatedIsSideways) (targetH / fullTabH).coerceIn(minOf(0.12f, ah), ah) else (targetW / fullTabH).coerceIn(minOf(0.12f, ah), ah)
                 ax += (aw - newAw) * 0.5f
                 ay += (ah - newAh) * 0.5f
                 aw = newAw
@@ -145,28 +141,28 @@ class CoordinateMatrix {
                 // while preserving constant density across Portrait & Landscape and independent X/Y tuning.
                 val maxScreenPx = maxOf(sw, sh)
                 val minScreenPx = minOf(sw, sh)
-                val maxTabMm = maxOf(effTabW, effTabH)
-                val minTabMm = minOf(effTabW, effTabH)
+                val maxTabMm = maxOf(effTabW, effTabH).coerceAtLeast(1f)
+                val minTabMm = minOf(effTabW, effTabH).coerceAtLeast(1f)
                 val portraitDensity = maxScreenPx / minTabMm
                 val baseDensity = if (minScreenPx / portraitDensity <= minTabMm && maxScreenPx / portraitDensity <= maxTabMm) {
                     portraitDensity
                 } else {
                     maxOf(portraitDensity.coerceAtMost(maxScreenPx / minTabMm), maxScreenPx / maxTabMm)
-                }
-                val baseBoxW = sw / baseDensity
-                val baseBoxH = sh / baseDensity
+                }.coerceAtLeast(0.1f)
+                val baseBoxW = (sw / baseDensity).coerceAtLeast(1f)
+                val baseBoxH = (sh / baseDensity).coerceAtLeast(1f)
 
                 val dpiScaleX = (240f / safeDpiX).coerceIn(0.16f, 1.0f)
                 val dpiScaleY = (240f / safeDpiY).coerceIn(0.16f, 1.0f)
-                var desiredW = baseBoxW * dpiScaleX
-                var desiredH = baseBoxH * dpiScaleY
+                var desiredW = (baseBoxW * dpiScaleX).coerceAtLeast(1f)
+                var desiredH = (baseBoxH * dpiScaleY).coerceAtLeast(1f)
 
                 val fitScale = minOf(effTabW / desiredW, effTabH / desiredH, 1f)
                 desiredW *= fitScale
                 desiredH *= fitScale
 
-                val newAw = if (!rotatedIsSideways) (desiredW / fullTabW).coerceIn(0.08f, aw) else (desiredH / fullTabW).coerceIn(0.08f, aw)
-                val newAh = if (!rotatedIsSideways) (desiredH / fullTabH).coerceIn(0.08f, ah) else (desiredW / fullTabH).coerceIn(0.08f, ah)
+                val newAw = if (!rotatedIsSideways) (desiredW / fullTabW).coerceIn(minOf(0.08f, aw), aw) else (desiredH / fullTabW).coerceIn(minOf(0.08f, aw), aw)
+                val newAh = if (!rotatedIsSideways) (desiredH / fullTabH).coerceIn(minOf(0.08f, ah), ah) else (desiredW / fullTabH).coerceIn(minOf(0.08f, ah), ah)
                 ax += (aw - newAw) * 0.5f
                 ay += (ah - newAh) * 0.5f
                 aw = newAw
@@ -181,22 +177,22 @@ class CoordinateMatrix {
                     if (tabletAspect > screenAspect) {
                         val targetRatio = screenAspect / tabletAspect
                         if (!rotatedIsSideways) {
-                            val newAw = (aw * targetRatio).coerceIn(0.12f, aw)
+                            val newAw = (aw * targetRatio).coerceIn(minOf(0.12f, aw), aw)
                             ax += (aw - newAw) * 0.5f
                             aw = newAw
                         } else {
-                            val newAh = (ah * targetRatio).coerceIn(0.12f, ah)
+                            val newAh = (ah * targetRatio).coerceIn(minOf(0.12f, ah), ah)
                             ay += (ah - newAh) * 0.5f
                             ah = newAh
                         }
                     } else {
                         val targetRatio = tabletAspect / screenAspect
                         if (!rotatedIsSideways) {
-                            val newAh = (ah * targetRatio).coerceIn(0.12f, ah)
+                            val newAh = (ah * targetRatio).coerceIn(minOf(0.12f, ah), ah)
                             ay += (ah - newAh) * 0.5f
                             ah = newAh
                         } else {
-                            val newAw = (aw * targetRatio).coerceIn(0.12f, aw)
+                            val newAw = (aw * targetRatio).coerceIn(minOf(0.12f, aw), aw)
                             ax += (aw - newAw) * 0.5f
                             aw = newAw
                         }

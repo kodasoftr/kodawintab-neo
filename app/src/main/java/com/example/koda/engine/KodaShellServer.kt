@@ -74,6 +74,7 @@ object KodaShellServer {
     @Volatile private var gpIsVisible = false
     private var gpPendingDeltaX = 0f
     private var gpPendingDeltaY = 0f
+    private val PACKAGE_NAME_REGEX = Regex("^[a-zA-Z0-9._]{1,255}$")
 
     @JvmStatic
     fun main(args: Array<String>) {
@@ -286,29 +287,33 @@ object KodaShellServer {
                 val probe = ProcessBuilder("/system/bin/getevent", "-lp")
                     .redirectErrorStream(true)
                     .start()
-                var currentDev = ""
-                BufferedReader(InputStreamReader(probe.inputStream)).use { br ->
-                    while (true) {
-                        val line = br.readLine() ?: break
-                        if (line.startsWith("add device")) {
-                            val idx = line.indexOf(':')
-                            if (idx >= 0) currentDev = line.substring(idx + 1).trim()
-                        } else if (currentDev.isNotEmpty()) {
-                            when {
-                                line.contains("ABS_X") || line.contains("ABS_MT_POSITION_X") -> {
-                                    extractMaxValue(line)?.let { devMaxX[currentDev] = it.coerceAtLeast(1f) }
-                                }
-                                line.contains("ABS_Y") || line.contains("ABS_MT_POSITION_Y") -> {
-                                    extractMaxValue(line)?.let { devMaxY[currentDev] = it.coerceAtLeast(1f) }
-                                }
-                                line.contains("ABS_PRESSURE") || line.contains("ABS_MT_PRESSURE") -> {
-                                    extractMaxValue(line)?.let { devMaxP[currentDev] = it.coerceAtLeast(1f) }
+                try {
+                    var currentDev = ""
+                    BufferedReader(InputStreamReader(probe.inputStream)).use { br ->
+                        while (true) {
+                            val line = br.readLine() ?: break
+                            if (line.startsWith("add device")) {
+                                val idx = line.indexOf(':')
+                                if (idx >= 0) currentDev = line.substring(idx + 1).trim()
+                            } else if (currentDev.isNotEmpty()) {
+                                when {
+                                    line.contains("ABS_X") || line.contains("ABS_MT_POSITION_X") -> {
+                                        extractMaxValue(line)?.let { devMaxX[currentDev] = it.coerceAtLeast(1f) }
+                                    }
+                                    line.contains("ABS_Y") || line.contains("ABS_MT_POSITION_Y") -> {
+                                        extractMaxValue(line)?.let { devMaxY[currentDev] = it.coerceAtLeast(1f) }
+                                    }
+                                    line.contains("ABS_PRESSURE") || line.contains("ABS_MT_PRESSURE") -> {
+                                        extractMaxValue(line)?.let { devMaxP[currentDev] = it.coerceAtLeast(1f) }
+                                    }
                                 }
                             }
                         }
                     }
+                    probe.waitFor()
+                } finally {
+                    runCatching { probe.destroy() }
                 }
-                probe.waitFor()
             }
 
             while (keepRunning) {
@@ -316,103 +321,107 @@ object KodaShellServer {
                     val proc = ProcessBuilder("/system/bin/getevent", "-l")
                         .redirectErrorStream(true)
                         .start()
-                    BufferedReader(InputStreamReader(proc.inputStream)).use { br ->
-                        val lastRawX = HashMap<String, Int>()
-                        val lastRawY = HashMap<String, Int>()
-                        var pendingRelX = 0f
-                        var pendingRelY = 0f
-                        var sawEventInPacket = false
-                        var packetIsStylus = false
-                        var packetIsMouse = false
-                        var packetDev = ""
+                    try {
+                        BufferedReader(InputStreamReader(proc.inputStream)).use { br ->
+                            val lastRawX = HashMap<String, Int>()
+                            val lastRawY = HashMap<String, Int>()
+                            var pendingRelX = 0f
+                            var pendingRelY = 0f
+                            var sawEventInPacket = false
+                            var packetIsStylus = false
+                            var packetIsMouse = false
+                            var packetDev = ""
 
-                        while (keepRunning) {
-                            val line = br.readLine() ?: break
-                            if (line.contains("SYN_REPORT")) {
-                                if (sawEventInPacket) {
-                                    if (packetIsMouse && (pendingRelX != 0f || pendingRelY != 0f)) {
-                                        synchronized(deltaLock) {
-                                            gpPendingDeltaX += pendingRelX
-                                            gpPendingDeltaY += pendingRelY
+                            while (keepRunning) {
+                                val line = br.readLine() ?: break
+                                if (line.contains("SYN_REPORT")) {
+                                    if (sawEventInPacket) {
+                                        if (packetIsMouse && (pendingRelX != 0f || pendingRelY != 0f)) {
+                                            synchronized(deltaLock) {
+                                                gpPendingDeltaX += pendingRelX
+                                                gpPendingDeltaY += pendingRelY
+                                            }
+                                            gpHasAbs = false
+                                            gpIsStylus = false
+                                            gpIsVisible = true
+                                            pointerSeq.incrementAndGet()
+                                            pendingRelX = 0f
+                                            pendingRelY = 0f
+                                        } else if (packetDev.isNotEmpty() &&
+                                            (lastRawX.containsKey(packetDev) || lastRawY.containsKey(packetDev))
+                                        ) {
+                                            val maxX = devMaxX[packetDev] ?: 32767f
+                                            val maxY = devMaxY[packetDev] ?: 32767f
+                                            gpAbsXNorm = ((lastRawX[packetDev] ?: 0) / maxX).coerceIn(0f, 1f)
+                                            gpAbsYNorm = ((lastRawY[packetDev] ?: 0) / maxY).coerceIn(0f, 1f)
+                                            gpHasAbs = true
+                                            gpIsStylus = packetIsStylus
+                                            gpIsVisible = true
+                                            pointerSeq.incrementAndGet()
                                         }
-                                        gpHasAbs = false
-                                        gpIsStylus = false
+                                        sawEventInPacket = false
+                                    }
+                                    continue
+                                }
+
+                                val parts = line.trim().split(Regex("\\s+"))
+                                if (parts.size < 4) continue
+                                val dev = parts[0].removeSuffix(":")
+                                val code = parts[2]
+                                val valHex = parts[3]
+                                packetDev = dev
+
+                                when (code) {
+                                    "REL_X" -> {
+                                        pendingRelX += valHex.toLongOrNull(16)?.toInt()?.toFloat() ?: 0f
+                                        packetIsMouse = true
+                                        sawEventInPacket = true
+                                    }
+                                    "REL_Y" -> {
+                                        pendingRelY += valHex.toLongOrNull(16)?.toInt()?.toFloat() ?: 0f
+                                        packetIsMouse = true
+                                        sawEventInPacket = true
+                                    }
+                                    "ABS_X", "ABS_MT_POSITION_X" -> {
+                                        lastRawX[dev] = valHex.toLongOrNull(16)?.toInt() ?: 0
+                                        sawEventInPacket = true
+                                    }
+                                    "ABS_Y", "ABS_MT_POSITION_Y" -> {
+                                        lastRawY[dev] = valHex.toLongOrNull(16)?.toInt() ?: 0
+                                        sawEventInPacket = true
+                                    }
+                                    "ABS_PRESSURE", "ABS_MT_PRESSURE" -> {
+                                        val pRaw = valHex.toLongOrNull(16)?.toInt() ?: 0
+                                        val maxP = devMaxP[dev] ?: 8191f
+                                        gpPressureNorm = (pRaw / maxP).coerceIn(0f, 1f)
+                                        packetIsStylus = true
+                                        sawEventInPacket = true
+                                    }
+                                    "BTN_TOOL_PEN", "BTN_STYLUS", "BTN_STYLUS2" -> {
+                                        packetIsStylus = true
+                                        if (valHex == "DOWN" || valHex == "00000001") {
+                                            gpIsVisible = true
+                                        }
+                                        sawEventInPacket = true
+                                    }
+                                    "BTN_LEFT", "BTN_RIGHT", "BTN_MIDDLE" -> {
+                                        packetIsMouse = true
                                         gpIsVisible = true
                                         pointerSeq.incrementAndGet()
-                                        pendingRelX = 0f
-                                        pendingRelY = 0f
-                                    } else if (packetDev.isNotEmpty() &&
-                                        (lastRawX.containsKey(packetDev) || lastRawY.containsKey(packetDev))
-                                    ) {
-                                        val maxX = devMaxX[packetDev] ?: 32767f
-                                        val maxY = devMaxY[packetDev] ?: 32767f
-                                        gpAbsXNorm = ((lastRawX[packetDev] ?: 0) / maxX).coerceIn(0f, 1f)
-                                        gpAbsYNorm = ((lastRawY[packetDev] ?: 0) / maxY).coerceIn(0f, 1f)
-                                        gpHasAbs = true
-                                        gpIsStylus = packetIsStylus
-                                        gpIsVisible = true
-                                        pointerSeq.incrementAndGet()
                                     }
-                                    sawEventInPacket = false
-                                }
-                                continue
-                            }
-
-                            val parts = line.trim().split(Regex("\\s+"))
-                            if (parts.size < 4) continue
-                            val dev = parts[0].removeSuffix(":")
-                            val code = parts[2]
-                            val valHex = parts[3]
-                            packetDev = dev
-
-                            when (code) {
-                                "REL_X" -> {
-                                    pendingRelX += valHex.toLongOrNull(16)?.toInt()?.toFloat() ?: 0f
-                                    packetIsMouse = true
-                                    sawEventInPacket = true
-                                }
-                                "REL_Y" -> {
-                                    pendingRelY += valHex.toLongOrNull(16)?.toInt()?.toFloat() ?: 0f
-                                    packetIsMouse = true
-                                    sawEventInPacket = true
-                                }
-                                "ABS_X", "ABS_MT_POSITION_X" -> {
-                                    lastRawX[dev] = valHex.toLongOrNull(16)?.toInt() ?: 0
-                                    sawEventInPacket = true
-                                }
-                                "ABS_Y", "ABS_MT_POSITION_Y" -> {
-                                    lastRawY[dev] = valHex.toLongOrNull(16)?.toInt() ?: 0
-                                    sawEventInPacket = true
-                                }
-                                "ABS_PRESSURE", "ABS_MT_PRESSURE" -> {
-                                    val pRaw = valHex.toLongOrNull(16)?.toInt() ?: 0
-                                    val maxP = devMaxP[dev] ?: 8191f
-                                    gpPressureNorm = (pRaw / maxP).coerceIn(0f, 1f)
-                                    packetIsStylus = true
-                                    sawEventInPacket = true
-                                }
-                                "BTN_TOOL_PEN", "BTN_STYLUS", "BTN_STYLUS2" -> {
-                                    packetIsStylus = true
-                                    if (valHex == "DOWN" || valHex == "00000001") {
-                                        gpIsVisible = true
+                                    "BTN_TOUCH" -> {
+                                        if (valHex == "DOWN" || valHex == "00000001") {
+                                            gpIsVisible = true
+                                        }
+                                        sawEventInPacket = true
                                     }
-                                    sawEventInPacket = true
-                                }
-                                "BTN_LEFT", "BTN_RIGHT", "BTN_MIDDLE" -> {
-                                    packetIsMouse = true
-                                    gpIsVisible = true
-                                    pointerSeq.incrementAndGet()
-                                }
-                                "BTN_TOUCH" -> {
-                                    if (valHex == "DOWN" || valHex == "00000001") {
-                                        gpIsVisible = true
-                                    }
-                                    sawEventInPacket = true
                                 }
                             }
                         }
+                        proc.waitFor()
+                    } finally {
+                        runCatching { proc.destroy() }
                     }
-                    proc.waitFor()
                 } catch (_: Throwable) {
                 }
                 Thread.sleep(2500L)
@@ -538,38 +547,48 @@ object KodaShellServer {
             val atmClass = Class.forName("android.app.ActivityTaskManager")
             val getService = atmClass.getMethod("getService")
             val atm = getService.invoke(null)
-            activityTaskManagerService = atm
-            moveRootTaskToDisplayMethod = atm.javaClass
-                .getMethod("moveRootTaskToDisplay", Int::class.javaPrimitiveType, Int::class.javaPrimitiveType)
-                .apply { isAccessible = true }
-            getTasksMethod = atm.javaClass
-                .getMethod("getTasks", Int::class.javaPrimitiveType)
-                .apply { isAccessible = true }
-            registerNativeTaskStackListener(atm)
+            if (atm != null) {
+                activityTaskManagerService = atm
+                moveRootTaskToDisplayMethod = atm.javaClass
+                    .getMethod("moveRootTaskToDisplay", Int::class.javaPrimitiveType, Int::class.javaPrimitiveType)
+                    .apply { isAccessible = true }
+                getTasksMethod = atm.javaClass
+                    .getMethod("getTasks", Int::class.javaPrimitiveType)
+                    .apply { isAccessible = true }
+                registerNativeTaskStackListener(atm)
+            }
         }
 
-        preferredStylusInputDeviceId = resolveBestStylusOrTouchDeviceId()
+        preferredStylusInputDeviceId = resolveBestStylusDeviceId()
     }
 
-    private fun resolveBestStylusOrTouchDeviceId(): Int {
+    private fun ensureValidStylusDeviceId(): Int {
+        val current = preferredStylusInputDeviceId
+        if (current != 0 && InputDevice.getDevice(current) != null) {
+            return current
+        }
+        val resolved = resolveBestStylusDeviceId()
+        preferredStylusInputDeviceId = resolved
+        return resolved
+    }
+
+    private fun resolveBestStylusDeviceId(): Int {
         return runCatching {
             val ids = InputDevice.getDeviceIds()
-            var fallbackTouchId = 0
+            var fallbackStylusId = 0
             for (id in ids) {
                 val dev = InputDevice.getDevice(id) ?: continue
                 if (dev.isVirtual) continue
                 val src = dev.sources
-                val hasPressure = dev.getMotionRange(MotionEvent.AXIS_PRESSURE) != null
-                if ((src and InputDevice.SOURCE_STYLUS) == InputDevice.SOURCE_STYLUS && hasPressure) {
-                    return@runCatching id
-                }
-                if (fallbackTouchId == 0 &&
-                    (src and InputDevice.SOURCE_TOUCHSCREEN) == InputDevice.SOURCE_TOUCHSCREEN
-                ) {
-                    fallbackTouchId = id
+                if ((src and InputDevice.SOURCE_STYLUS) == InputDevice.SOURCE_STYLUS) {
+                    val hasPressure = dev.getMotionRange(MotionEvent.AXIS_PRESSURE) != null
+                    if (hasPressure) return@runCatching id
+                    if (fallbackStylusId == 0) fallbackStylusId = id
                 }
             }
-            fallbackTouchId
+            // Never fall back to a finger touchscreen deviceId because drawing apps check
+            // InputDevice.sources for SOURCE_STYLUS and AXIS_PRESSURE/AXIS_TILT ranges.
+            fallbackStylusId
         }.getOrDefault(0)
     }
 
@@ -630,6 +649,7 @@ object KodaShellServer {
                         val pkg = input.readUTF()
                         authenticated = allowedPackage.isEmpty() || pkg.isEmpty() || pkg == allowedPackage
                         if (authenticated) {
+                            ensureValidStylusDeviceId()
                             output.writeByte(KodaEngineProtocol.STATUS_OK.toInt())
                             output.writeInt(Process.myUid())
                             output.writeInt(Process.myPid())
@@ -675,8 +695,12 @@ object KodaShellServer {
                             }
                         })
                         val coords = arrayOf(MotionEvent.PointerCoords())
-                        var downTime = stylusDownTimes[slotDeviceId] ?: SystemClock.uptimeMillis()
-                        val mappedDeviceId = if (preferredStylusInputDeviceId != 0) preferredStylusInputDeviceId else 0
+                        var existingDownTime = stylusDownTimes[slotDeviceId]
+                        val isOrphanUp = (action == MotionEvent.ACTION_UP || action == MotionEvent.ACTION_CANCEL) &&
+                            existingDownTime == null
+                        var downTime = existingDownTime ?: SystemClock.uptimeMillis()
+                        val resolvedStylusId = ensureValidStylusDeviceId()
+                        val mappedDeviceId = resolvedStylusId
                         val degToRad = (PI / 180.0).toFloat()
                         val maxTiltRad = (PI / 2.0).toFloat()
 
@@ -688,6 +712,8 @@ object KodaShellServer {
                             val tiltXDeg = input.readFloat()
                             val tiltYDeg = input.readFloat()
                             val buttonState = input.readInt()
+
+                            if (isOrphanUp) continue
 
                             val isTouchAction = action == MotionEvent.ACTION_DOWN || action == MotionEvent.ACTION_MOVE
                             val effectivePressure = when {
@@ -706,6 +732,7 @@ object KodaShellServer {
                             pc.x = x
                             pc.y = y
                             pc.pressure = effectivePressure
+                            pc.setAxisValue(MotionEvent.AXIS_PRESSURE, effectivePressure)
                             pc.size = if (effectivePressure > 0f) (0.04f + effectivePressure * 0.96f) else 0f
                             pc.touchMajor = contactSpan
                             pc.touchMinor = contactSpan
@@ -721,12 +748,68 @@ object KodaShellServer {
 
                             if (i == 0) {
                                 if (action == MotionEvent.ACTION_DOWN) {
+                                    // Close any dangling stroke cleanly before starting a fresh ACTION_DOWN
+                                    if (existingDownTime != null) {
+                                        val cancelEvent = MotionEvent.obtain(
+                                            existingDownTime,
+                                            maxOf(eventTime, existingDownTime),
+                                            MotionEvent.ACTION_CANCEL,
+                                            1,
+                                            props,
+                                            coords,
+                                            0,
+                                            0,
+                                            1f,
+                                            1f,
+                                            mappedDeviceId,
+                                            0,
+                                            InputDevice.SOURCE_STYLUS or InputDevice.SOURCE_TOUCHSCREEN,
+                                            0
+                                        )
+                                        if (displayId > 0) {
+                                            runCatching { motionSetDisplayIdMethod?.invoke(cancelEvent, displayId) }
+                                        }
+                                        injectEvent(cancelEvent)
+                                        cancelEvent.recycle()
+                                    }
                                     downTime = eventTime
                                     stylusDownTimes[slotDeviceId] = downTime
+                                } else if (action == MotionEvent.ACTION_MOVE && existingDownTime == null) {
+                                    // Missed ACTION_DOWN packet: synthesize ACTION_DOWN first so InputDispatcher never drops the stroke
+                                    downTime = eventTime
+                                    stylusDownTimes[slotDeviceId] = downTime
+                                    existingDownTime = downTime
+                                    val synthDown = MotionEvent.obtain(
+                                        downTime,
+                                        downTime,
+                                        MotionEvent.ACTION_DOWN,
+                                        1,
+                                        props,
+                                        coords,
+                                        0,
+                                        buttonState,
+                                        1f,
+                                        1f,
+                                        mappedDeviceId,
+                                        0,
+                                        InputDevice.SOURCE_STYLUS or InputDevice.SOURCE_TOUCHSCREEN,
+                                        0
+                                    )
+                                    if (displayId > 0) {
+                                        runCatching { motionSetDisplayIdMethod?.invoke(synthDown, displayId) }
+                                    }
+                                    injectEvent(synthDown)
+                                    synthDown.recycle()
+                                }
+
+                                val safeEventTime = if (isTouchAction || action == MotionEvent.ACTION_UP || action == MotionEvent.ACTION_CANCEL) {
+                                    maxOf(eventTime, downTime)
+                                } else {
+                                    eventTime
                                 }
                                 event = MotionEvent.obtain(
                                     downTime,
-                                    eventTime,
+                                    safeEventTime,
                                     action,
                                     1,
                                     props,
@@ -741,7 +824,7 @@ object KodaShellServer {
                                     0
                                 )
                             } else {
-                                event?.addBatch(eventTime, coords, 0)
+                                event?.addBatch(maxOf(eventTime, downTime), coords, 0)
                             }
                         }
 
@@ -749,15 +832,17 @@ object KodaShellServer {
                             stylusDownTimes.remove(slotDeviceId)
                         }
 
-                        val ok = if (event != null) {
-                            if (displayId > 0) {
-                                runCatching { motionSetDisplayIdMethod?.invoke(event, displayId) }
+                        val ok = when {
+                            isOrphanUp -> true
+                            event != null -> {
+                                if (displayId > 0) {
+                                    runCatching { motionSetDisplayIdMethod?.invoke(event, displayId) }
+                                }
+                                val injected = injectEvent(event)
+                                event.recycle()
+                                injected
                             }
-                            val injected = injectEvent(event)
-                            event.recycle()
-                            injected
-                        } else {
-                            false
+                            else -> false
                         }
                         output.writeByte(
                             if (ok) KodaEngineProtocol.STATUS_OK.toInt()
@@ -780,15 +865,10 @@ object KodaShellServer {
                         val buttonState = input.readInt()
                         val vScroll = input.readFloat()
                         val now = SystemClock.uptimeMillis()
-                        val downTime = if (action == MotionEvent.ACTION_DOWN) {
-                            mouseDownTimes[deviceId] = now
-                            now
-                        } else {
-                            mouseDownTimes[deviceId] ?: now
-                        }
-                        if (action == MotionEvent.ACTION_UP || action == MotionEvent.ACTION_CANCEL) {
-                            mouseDownTimes.remove(deviceId)
-                        }
+
+                        val existingDown = mouseDownTimes[deviceId]
+                        val isOrphanUp = (action == MotionEvent.ACTION_UP || action == MotionEvent.ACTION_CANCEL) &&
+                            existingDown == null
 
                         val props = arrayOf(MotionEvent.PointerProperties().apply {
                             id = 0
@@ -799,16 +879,50 @@ object KodaShellServer {
                             this.y = y
                             setAxisValue(MotionEvent.AXIS_VSCROLL, vScroll)
                         })
-                        val event = MotionEvent.obtain(
-                            downTime, now, action, 1, props, coords,
-                            0, buttonState, 1f, 1f, deviceId, 0,
-                            InputDevice.SOURCE_MOUSE, 0
-                        )
-                        if (displayId > 0) {
-                            runCatching { motionSetDisplayIdMethod?.invoke(event, displayId) }
+
+                        var ok = true
+                        if (!isOrphanUp) {
+                            val downTime = when {
+                                action == MotionEvent.ACTION_DOWN -> {
+                                    if (existingDown != null) {
+                                        val cancelEv = MotionEvent.obtain(
+                                            existingDown, maxOf(now, existingDown), MotionEvent.ACTION_CANCEL,
+                                            1, props, coords, 0, 0, 1f, 1f, deviceId, 0, InputDevice.SOURCE_MOUSE, 0
+                                        )
+                                        if (displayId > 0) runCatching { motionSetDisplayIdMethod?.invoke(cancelEv, displayId) }
+                                        injectEvent(cancelEv)
+                                        cancelEv.recycle()
+                                    }
+                                    mouseDownTimes[deviceId] = now
+                                    now
+                                }
+                                action == MotionEvent.ACTION_MOVE && existingDown == null -> {
+                                    mouseDownTimes[deviceId] = now
+                                    val synthDown = MotionEvent.obtain(
+                                        now, now, MotionEvent.ACTION_DOWN,
+                                        1, props, coords, 0, buttonState, 1f, 1f, deviceId, 0, InputDevice.SOURCE_MOUSE, 0
+                                    )
+                                    if (displayId > 0) runCatching { motionSetDisplayIdMethod?.invoke(synthDown, displayId) }
+                                    injectEvent(synthDown)
+                                    synthDown.recycle()
+                                    now
+                                }
+                                else -> existingDown ?: now
+                            }
+                            if (action == MotionEvent.ACTION_UP || action == MotionEvent.ACTION_CANCEL) {
+                                mouseDownTimes.remove(deviceId)
+                            }
+                            val event = MotionEvent.obtain(
+                                downTime, maxOf(now, downTime), action, 1, props, coords,
+                                0, buttonState, 1f, 1f, deviceId, 0,
+                                InputDevice.SOURCE_MOUSE, 0
+                            )
+                            if (displayId > 0) {
+                                runCatching { motionSetDisplayIdMethod?.invoke(event, displayId) }
+                            }
+                            ok = injectEvent(event)
+                            event.recycle()
                         }
-                        val ok = injectEvent(event)
-                        event.recycle()
                         output.writeByte(
                             if (ok) KodaEngineProtocol.STATUS_OK.toInt()
                             else KodaEngineProtocol.STATUS_ERR_INJECT.toInt()
@@ -856,7 +970,7 @@ object KodaShellServer {
 
                     KodaEngineProtocol.CMD_GRANT_OVERLAY_OP -> {
                         val targetPkg = input.readUTF()
-                        if (!authenticated || targetPkg.isBlank()) {
+                        if (!authenticated || !PACKAGE_NAME_REGEX.matches(targetPkg)) {
                             output.writeByte(KodaEngineProtocol.STATUS_ERR_AUTH.toInt())
                             output.flush()
                             continue

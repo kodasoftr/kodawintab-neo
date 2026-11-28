@@ -133,6 +133,11 @@ class KodasoftrDesktopPresentation(
 
         setContentView(root)
         rebuildAppMenu()
+    }
+
+    override fun onStart() {
+        super.onStart()
+        clockHandler.removeCallbacks(clockRunnable)
         clockHandler.post(clockRunnable)
     }
 
@@ -206,6 +211,9 @@ class KodasoftrDesktopPresentation(
     ) : View(context) {
 
         private val bgPaint = Paint(Paint.ANTI_ALIAS_FLAG)
+        private val cardPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.argb(180, 19, 20, 36)
+        }
         private val gridPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
             color = Color.argb(26, 0, 229, 255)
             strokeWidth = 1.5f
@@ -214,11 +222,13 @@ class KodasoftrDesktopPresentation(
             color = Color.argb(220, 243, 244, 251)
             textSize = 48f
             typeface = Typeface.DEFAULT_BOLD
+            textAlign = Paint.Align.CENTER
         }
         private val subPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
             color = Color.argb(200, 0, 229, 255)
             textSize = 20f
             typeface = Typeface.MONOSPACE
+            textAlign = Paint.Align.CENTER
         }
         private val cursorRingPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
             color = Color.parseColor("#00E676")
@@ -230,10 +240,23 @@ class KodasoftrDesktopPresentation(
             style = Paint.Style.FILL
         }
 
+        private val badgeRect = RectF()
         private var stylusNormX = 0.5f
         private var stylusNormY = 0.5f
         private var stylusPressure = 0f
         private var stylusDown = false
+
+        override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) {
+            super.onSizeChanged(w, h, oldw, oldh)
+            val fw = w.toFloat().coerceAtLeast(1f)
+            val fh = h.toFloat().coerceAtLeast(1f)
+            bgPaint.shader = LinearGradient(
+                0f, 0f, fw, fh,
+                Color.parseColor("#090B16"),
+                Color.parseColor("#171433"),
+                Shader.TileMode.CLAMP
+            )
+        }
 
         fun updateStylus(nx: Float, ny: Float, pressure: Float, isDown: Boolean) {
             stylusNormX = nx.coerceIn(0f, 1f)
@@ -260,12 +283,14 @@ class KodasoftrDesktopPresentation(
             val w = width.toFloat().coerceAtLeast(1f)
             val h = height.toFloat().coerceAtLeast(1f)
 
-            bgPaint.shader = LinearGradient(
-                0f, 0f, w, h,
-                Color.parseColor("#090B16"),
-                Color.parseColor("#171433"),
-                Shader.TileMode.CLAMP
-            )
+            if (bgPaint.shader == null) {
+                bgPaint.shader = LinearGradient(
+                    0f, 0f, w, h,
+                    Color.parseColor("#090B16"),
+                    Color.parseColor("#171433"),
+                    Shader.TileMode.CLAMP
+                )
+            }
             canvas.drawRect(0f, 0f, w, h, bgPaint)
 
             val step = 80f
@@ -281,14 +306,9 @@ class KodasoftrDesktopPresentation(
             }
 
             // Center Kodasoftr Studio badge
-            val badgeRect = RectF(w * 0.5f - 260f, h * 0.42f - 70f, w * 0.5f + 260f, h * 0.42f + 70f)
-            val cardPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-                color = Color.argb(180, 19, 20, 36)
-            }
+            badgeRect.set(w * 0.5f - 260f, h * 0.42f - 70f, w * 0.5f + 260f, h * 0.42f + 70f)
             canvas.drawRoundRect(badgeRect, 24f, 24f, cardPaint)
 
-            titlePaint.textAlign = Paint.Align.CENTER
-            subPaint.textAlign = Paint.Align.CENTER
             canvas.drawText("KODASOFTR DESKTOP", w * 0.5f, h * 0.42f - 8f, titlePaint)
             canvas.drawText(
                 "Pen Display #$displayId · $resolutionLabel · 8192 WinTab",

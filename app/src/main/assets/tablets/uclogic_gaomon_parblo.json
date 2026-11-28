@@ -1,0 +1,20 @@
+{
+  "id": "uclogic_gaomon_parblo",
+  "name": "UC-Logic / Gaomon / Parblo",
+  "brand": "UC-Logic / Gaomon / Parblo",
+  "vendorId": 21827,
+  "productIds": [110, 120, 121, 122, 200, 300, 16448],
+  "widthMm": 203.2,
+  "heightMm": 127.0,
+  "maxX": 40000,
+  "maxY": 25000,
+  "maxPressure": 8191,
+  "lpi": 5080,
+  "pollingRateHz": 233,
+  "interfaceNumber": 0,
+  "endpointAddress": 129,
+  "parserType": "UCLOGIC",
+  "initControlTransfers": [],
+  "expressKeysCount": 8,
+  "supportsTilt": true
+}

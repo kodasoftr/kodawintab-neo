@@ -520,6 +520,9 @@ class KodaEngineClient(private val context: Context) {
         }
         val pixels = IntArray(w * h)
         scaled.getPixels(pixels, 0, w, 0, 0, w, h)
+        if (scaled !== bitmap) {
+            scaled.recycle()
+        }
         val bytes = ByteArray(pixels.size * 4)
         for (i in pixels.indices) {
             val c = pixels[i]

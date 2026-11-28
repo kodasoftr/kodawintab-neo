@@ -1,0 +1,32 @@
+{
+  "id": "xppen_artist_pendisplay",
+  "name": "XP-Pen Artist 15.6 / 22 (Pen Display)",
+  "brand": "XP-Pen",
+  "vendorId": 10429,
+  "productIds": [2333, 2345, 2346, 2347, 2350, 2351],
+  "widthMm": 293.76,
+  "heightMm": 165.24,
+  "maxX": 32767,
+  "maxY": 32767,
+  "maxPressure": 8191,
+  "lpi": 5080,
+  "pollingRateHz": 266,
+  "interfaceNumber": 2,
+  "endpointAddress": 131,
+  "parserType": "XP_PEN",
+  "initControlTransfers": [
+    {
+      "requestType": 33,
+      "request": 9,
+      "value": 514,
+      "index": 2,
+      "dataHex": "02B0040000000000"
+    }
+  ],
+  "expressKeysCount": 8,
+  "supportsTilt": true,
+  "isPenDisplay": true,
+  "nativeWidthPx": 1920,
+  "nativeHeightPx": 1080,
+  "nativeDpi": 166
+}

@@ -82,7 +82,8 @@ class UsbTabletCoordinator(
 
     @Volatile var onMouseCoordinate: ((x: Float, y: Float, isVisible: Boolean, channel: Int) -> Unit)? = null
     @Volatile var resolveCursorChannel: ((deviceKey: String) -> Int)? = null
-    @Volatile var onTabletProfileConnected: ((slot: TabletSlotId, profile: TabletProfileJson) -> Unit)? = null
+    @Volatile var resolveTabletSlot: ((deviceKey: String) -> TabletSlotId?)? = null
+    @Volatile var onTabletProfileConnected: ((slot: TabletSlotId, profile: TabletProfileJson, rawDescriptors: ByteArray?) -> Unit)? = null
     @Volatile var mouseDisplayWidthPx: Float = 1080f
     @Volatile var mouseDisplayHeightPx: Float = 2400f
     @Volatile var mouseSensitivity: Float = 1.0f
@@ -116,12 +117,25 @@ class UsbTabletCoordinator(
 
     private class ActiveReaderSession(
         val kind: UsbPeripheralKind,
+        val slot: TabletSlotId,
         val connection: UsbDeviceConnection,
         val usbInterface: UsbInterface,
         val extraInterfaces: List<UsbInterface>,
         val running: AtomicBoolean,
         val threads: List<Thread>
     )
+
+    private fun resolveTargetTabletSlot(deviceKey: String, requestedSlot: TabletSlotId): TabletSlotId {
+        if (requestedSlot == TabletSlotId.MESA_2) return TabletSlotId.MESA_2
+        val fromHub = resolveTabletSlot?.invoke(deviceKey)
+        if (fromHub == TabletSlotId.MESA_1 || fromHub == TabletSlotId.MESA_2) {
+            return fromHub
+        }
+        val mesa1Busy = activeConnections.values.any {
+            it.kind == UsbPeripheralKind.TABLET && it.running.get() && it.slot == TabletSlotId.MESA_1
+        }
+        return if (mesa1Busy) TabletSlotId.MESA_2 else TabletSlotId.MESA_1
+    }
 
     private val usbReceiver = object : BroadcastReceiver() {
         override fun onReceive(ctx: Context?, intent: Intent?) {
@@ -132,7 +146,8 @@ class UsbTabletCoordinator(
                     if (device != null && (granted || usbManager?.hasPermission(device) == true)) {
                         permissionRequestedAt.remove(buildDeviceKey(device))
                         _lastUsbEventLog.value = "Permissão USB concedida: ${device.productName ?: device.deviceName}"
-                        openAndClaimDevice(device, TabletSlotId.MESA_1)
+                        val targetSlot = resolveTargetTabletSlot(buildDeviceKey(device), TabletSlotId.MESA_1)
+                        openAndClaimDevice(device, targetSlot)
                     } else if (device != null) {
                         _lastUsbEventLog.value = "Permissão USB recusada pelo usuário (${device.productName ?: "USB"})."
                     }
@@ -148,10 +163,13 @@ class UsbTabletCoordinator(
                     _lastUsbEventLog.value = "USB conectado: ${device?.productName ?: "Dispositivo"}"
                     if (device != null && kind != null) {
                         val canControlMouse = engineClient?.state?.value?.isActive == true ||
+                            engineClient?.state?.value?.coreEngineActive == true ||
+                            engineClient?.isPermanentlyActivated() == true ||
                             com.example.hub.KodaAccessibilityService.isServiceRunning.value
                         if (kind == UsbPeripheralKind.TABLET || (kind == UsbPeripheralKind.MOUSE && canControlMouse)) {
                             if (usbManager?.hasPermission(device) == true) {
-                                openAndClaimDevice(device, TabletSlotId.MESA_1)
+                                val targetSlot = resolveTargetTabletSlot(buildDeviceKey(device), TabletSlotId.MESA_1)
+                                openAndClaimDevice(device, targetSlot)
                             } else {
                                 requestPermissionIfDue(device)
                             }
@@ -223,10 +241,13 @@ class UsbTabletCoordinator(
             val kind = classifyDevice(device) ?: return // Ignora ADB/MTP/Storage/System USB
             _lastUsbEventLog.value = "USB conectado: ${device.productName ?: "Dispositivo"}"
             val canControlMouse = engineClient?.state?.value?.isActive == true ||
+                engineClient?.state?.value?.coreEngineActive == true ||
+                engineClient?.isPermanentlyActivated() == true ||
                 com.example.hub.KodaAccessibilityService.isServiceRunning.value
             if (kind == UsbPeripheralKind.TABLET || (kind == UsbPeripheralKind.MOUSE && canControlMouse)) {
                 if (usbManager?.hasPermission(device) == true) {
-                    openAndClaimDevice(device, TabletSlotId.MESA_1)
+                    val targetSlot = resolveTargetTabletSlot(buildDeviceKey(device), TabletSlotId.MESA_1)
+                    openAndClaimDevice(dev = device, targetSlot = targetSlot)
                 } else {
                     requestPermissionIfDue(device)
                 }
@@ -235,10 +256,14 @@ class UsbTabletCoordinator(
         }
     }
 
+    private fun openAndClaimDevice(dev: UsbDevice, targetSlot: TabletSlotId) =
+        openAndClaimDevice(device = dev, targetSlot = targetSlot, refreshListAfter = true)
+
     fun refreshConnectedDevices(allowAutoClaim: Boolean = true) {
         val result = ArrayList<ConnectedUsbDeviceInfo>()
         val seenVidPids = HashSet<String>()
         val isActivated = engineClient?.isPermanentlyActivated() == true ||
+            engineClient?.state?.value?.coreEngineActive == true ||
             engineClient?.state?.value?.isActive == true
         val canControlMouse = isActivated ||
             com.example.hub.KodaAccessibilityService.isServiceRunning.value
@@ -253,7 +278,8 @@ class UsbTabletCoordinator(
                     (kind == UsbPeripheralKind.MOUSE && canControlMouse)
                 if (allowAutoClaim && shouldAutoClaim && !activeConnections.containsKey(key)) {
                     if (mgr.hasPermission(dev)) {
-                        openAndClaimDevice(dev, TabletSlotId.MESA_1, refreshListAfter = false)
+                        val targetSlot = resolveTargetTabletSlot(key, TabletSlotId.MESA_1)
+                        openAndClaimDevice(dev, targetSlot, refreshListAfter = false)
                     } else if (isActivated) {
                         requestPermissionIfDue(dev)
                     }
@@ -479,7 +505,7 @@ class UsbTabletCoordinator(
 
         // Standard HID wake-up (SET_IDLE + SET_PROTOCOL Report) + vendor-specific tablet handshakes
         runHidStandardSetup(connection, targetIntf, extraClaimed)
-        runVendorInitialization(connection, device, matchedProfile)
+        runVendorInitialization(connection, device, targetIntf, matchedProfile)
 
         // Detect optional vendor bulk-out endpoint for proprietary Koda Stream Engine USB video frames
         findVendorVideoBulkOutEndpoint(device)?.let { (videoIntf, bulkEp) ->
@@ -538,10 +564,19 @@ class UsbTabletCoordinator(
             seenAddr.add(it.address)
             all.add(it)
         }
-        // Any remaining IN endpoints on primary interface and claimed sibling HID interfaces
+        // Any remaining IN endpoints on primary interface and claimed non-boot sibling HID interfaces
         val allIntfs = listOf(targetIntf) + extraInterfaces
         for (intf in allIntfs) {
             if (intf.interfaceClass != UsbConstants.USB_CLASS_HID) continue
+            // Keep sibling boot mouse/keyboard interfaces claimed above (detaches OS cursor),
+            // but NEVER mix 0-pressure mouse-compat HID reports into tablet stylus pipeline!
+            if (kind == UsbPeripheralKind.TABLET &&
+                intf != targetIntf &&
+                intf.interfaceSubclass == 1 &&
+                (intf.interfaceProtocol == 1 || intf.interfaceProtocol == 2)
+            ) {
+                continue
+            }
             for (i in 0 until intf.endpointCount) {
                 val ep = intf.getEndpoint(i)
                 if (ep.direction == UsbConstants.USB_DIR_IN &&
@@ -625,9 +660,12 @@ class UsbTabletCoordinator(
             Thread({
                 Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_DISPLAY)
                 val buffer = ByteArray(packetSize)
+                var fastErrors = 0
                 while (running.get()) {
+                    val t0 = System.nanoTime()
                     val bytesRead = connection.bulkTransfer(endpoint, buffer, packetSize, 40)
                     if (bytesRead > 0) {
+                        fastErrors = 0
                         totalPacketsReceived.incrementAndGet()
                         synchronized(mouseLock) {
                             if (mouseParser.parse(buffer, bytesRead, mouseSensitivity)) {
@@ -690,6 +728,21 @@ class UsbTabletCoordinator(
                                 }
                             }
                         }
+                    } else if (bytesRead < 0) {
+                        val elapsedNs = System.nanoTime() - t0
+                        if (elapsedNs < 2_000_000L) {
+                            fastErrors++
+                            if (fastErrors >= 12) break
+                            try {
+                                Thread.sleep(4)
+                            } catch (_: InterruptedException) {
+                                break
+                            }
+                        } else {
+                            fastErrors = 0
+                        }
+                    } else {
+                        fastErrors = 0
                     }
                 }
             }, "KodaMouseReader-${device.productId}-$idx").apply {
@@ -700,6 +753,7 @@ class UsbTabletCoordinator(
 
         activeConnections[key] = ActiveReaderSession(
             kind = UsbPeripheralKind.MOUSE,
+            slot = TabletSlotId.MESA_1,
             connection = connection,
             usbInterface = targetIntf,
             extraInterfaces = extraInterfaces,
@@ -708,6 +762,20 @@ class UsbTabletCoordinator(
         )
         _lastUsbEventLog.value = "Mouse USB capturado (${endpoints.size} ep, cursor do sistema removido): ${device.productName ?: "HID Mouse"}"
         if (refreshListAfter) refreshConnectedDevices(allowAutoClaim = false)
+    }
+
+    private fun readHidReportDescriptor(
+        connection: UsbDeviceConnection,
+        intfId: Int
+    ): ByteArray? {
+        val buf = ByteArray(512)
+        val n = runCatching {
+            connection.controlTransfer(0x81, 0x06, 0x2200, intfId, buf, buf.size, 200)
+        }.getOrDefault(-1)
+        if (n > 8) {
+            return buf.copyOf(n)
+        }
+        return connection.rawDescriptors
     }
 
     private fun startTabletReaderSession(
@@ -723,26 +791,58 @@ class UsbTabletCoordinator(
         refreshListAfter: Boolean
     ) {
         val pipeline = if (targetSlot == TabletSlotId.MESA_2) pipelineMesa2 else pipelineMesa1
-        val effectiveProfile = matchedProfile ?: profileRepo.getProfileById("generic_hid")
+        val baseProfile = matchedProfile ?: profileRepo.getProfileById("generic_hid")
+        val hidDescriptor = readHidReportDescriptor(connection, targetIntf.id)
+        val decodedLayout = com.example.driver.HidDescriptorDecoder.decode(hidDescriptor)
+        val useDecoded = hidDescriptor != null &&
+            (decodedLayout.hasDigitizerUsagePage || baseProfile.id == "generic_hid")
+        val effectiveProfile = if (useDecoded) {
+            baseProfile.copy(
+                maxX = maxOf(baseProfile.maxX, decodedLayout.logicalMaxX),
+                maxY = maxOf(baseProfile.maxY, decodedLayout.logicalMaxY),
+                maxPressure = maxOf(baseProfile.maxPressure, decodedLayout.logicalMaxPressure)
+            )
+        } else {
+            baseProfile
+        }
+
         if (kind == UsbPeripheralKind.TABLET) {
-            val parser = profileRepo.createParserFor(effectiveProfile, connection.rawDescriptors)
+            val parser = profileRepo.createParserFor(effectiveProfile, hidDescriptor)
             pipeline.activeParser = parser
-            onTabletProfileConnected?.invoke(targetSlot, effectiveProfile)
+            onTabletProfileConnected?.invoke(targetSlot, effectiveProfile, hidDescriptor)
             pipeline.start()
         }
 
         val running = AtomicBoolean(true)
         val threads = endpoints.mapIndexed { idx, endpoint ->
-            val packetSize = endpoint.maxPacketSize.coerceIn(8, 64)
+            val packetSize = endpoint.maxPacketSize.coerceIn(6, 64)
             Thread({
                 Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_DISPLAY)
                 val preAllocBuffer = ByteArray(packetSize)
+                var fastErrors = 0
                 while (running.get()) {
+                    val t0 = System.nanoTime()
                     val bytesRead = connection.bulkTransfer(endpoint, preAllocBuffer, packetSize, 50)
                     if (bytesRead > 0) {
+                        fastErrors = 0
                         totalPacketsReceived.incrementAndGet()
                         pipeline.ringBuffer.offer(preAllocBuffer, bytesRead, System.nanoTime())
                         pipeline.wakeWorker()
+                    } else if (bytesRead < 0) {
+                        val elapsedNs = System.nanoTime() - t0
+                        if (elapsedNs < 2_000_000L) {
+                            fastErrors++
+                            if (fastErrors >= 12) break
+                            try {
+                                Thread.sleep(4)
+                            } catch (_: InterruptedException) {
+                                break
+                            }
+                        } else {
+                            fastErrors = 0
+                        }
+                    } else {
+                        fastErrors = 0
                     }
                 }
             }, "KodaUsbReader-${device.productId}-$idx").apply {
@@ -753,6 +853,7 @@ class UsbTabletCoordinator(
 
         activeConnections[key] = ActiveReaderSession(
             kind = UsbPeripheralKind.TABLET,
+            slot = targetSlot,
             connection = connection,
             usbInterface = targetIntf,
             extraInterfaces = extraInterfaces,
@@ -760,10 +861,11 @@ class UsbTabletCoordinator(
             threads = threads
         )
         val engineReady = engineClient?.state?.value?.isActive == true
+        val coreReady = engineClient?.state?.value?.coreEngineActive == true
         val permOtg = engineClient?.isPermanentlyActivated() == true
         val modeTag = when {
-            engineReady -> "Shell UID 2000 + OTG force=true"
-            permOtg -> "USB OTG Direto Permanente (${endpoints.size} ep)"
+            engineReady -> "Modo ADB Shell UID 2000 + OTG"
+            coreReady || permOtg -> "Modo Engine Própria OTG (${endpoints.size} ep)"
             else -> "OTG force=true"
         }
         _lastUsbEventLog.value = "Driver ativo: ${effectiveProfile.name} ($modeTag)"
@@ -773,6 +875,7 @@ class UsbTabletCoordinator(
     private fun runVendorInitialization(
         connection: UsbDeviceConnection,
         device: UsbDevice,
+        targetIntf: UsbInterface,
         profile: TabletProfileJson?
     ) {
         if (profile != null) {
@@ -784,14 +887,27 @@ class UsbTabletCoordinator(
         val vid = profile?.vendorId ?: device.vendorId
         when (vid) {
             VID_UGEE_XPPEN -> {
-                // Standard XP-Pen / Ugee full-feature tablet mode packet (Report ID 0x02 B0 04) + report 0x06/0x08 probes
+                // Standard XP-Pen / Ugee full-feature tablet mode packet (Report ID 0x02 B0 04) + feature 0x0302 + OUT endpoint
                 val ugeeEnable = byteArrayOf(0x02, 0xB0.toByte(), 0x04, 0x00)
+                val ugeeEnable8 = byteArrayOf(0x02, 0xB0.toByte(), 0x04, 0x00, 0x00, 0x00, 0x00, 0x00)
                 connection.controlTransfer(0x21, 0x09, 0x0202, 0, ugeeEnable, ugeeEnable.size, 200)
                 connection.controlTransfer(0x21, 0x09, 0x0202, 1, ugeeEnable, ugeeEnable.size, 200)
+                for (intfIdx in intArrayOf(0, targetIntf.id, 2).distinct()) {
+                    connection.controlTransfer(0x21, 0x09, 0x0302, intfIdx, ugeeEnable8, ugeeEnable8.size, 200)
+                }
+                for (i in 0 until targetIntf.endpointCount) {
+                    val ep = targetIntf.getEndpoint(i)
+                    if (ep.direction == UsbConstants.USB_DIR_OUT &&
+                        (ep.type == UsbConstants.USB_ENDPOINT_XFER_INT || ep.type == UsbConstants.USB_ENDPOINT_XFER_BULK)
+                    ) {
+                        runCatching { connection.bulkTransfer(ep, ugeeEnable8, ugeeEnable8.size, 150) }
+                    }
+                }
                 val probe = ByteArray(16)
                 connection.controlTransfer(0x80, 0x06, 0x0364, 0x0409, probe, probe.size, 150)
             }
-            VID_HUION, VID_UCLOGIC -> {
+            VID_HUION, VID_UCLOGIC, VID_BOSTO, 0x2179 -> {
+                // Reading Huion/UC-Logic string descriptors (0x03C8/0x03CA) switches firmware out of boot mouse into full pen mode
                 val descBuf = ByteArray(64)
                 for (descIndex in intArrayOf(0x03C8, 0x0364, 0x0365, 0x0369, 0x0379, 0x03CA)) {
                     connection.controlTransfer(0x80, 0x06, descIndex, 0x0409, descBuf, descBuf.size, 150)
@@ -803,10 +919,24 @@ class UsbTabletCoordinator(
                 connection.controlTransfer(0x21, 0x09, 0x0302, 0, feat2, feat2.size, 200)
                 val feat4 = byteArrayOf(0x04, 0x02)
                 connection.controlTransfer(0x21, 0x09, 0x0304, 0, feat4, feat4.size, 200)
+                if (targetIntf.id != 0) {
+                    connection.controlTransfer(0x21, 0x09, 0x0302, targetIntf.id, feat2, feat2.size, 200)
+                }
             }
             VID_VEIKK -> {
                 val veikkInit = byteArrayOf(0x09, 0x01, 0x00, 0x00)
                 connection.controlTransfer(0x21, 0x09, 0x0309, 0, veikkInit, veikkInit.size, 200)
+                if (targetIntf.id != 0) {
+                    connection.controlTransfer(0x21, 0x09, 0x0309, targetIntf.id, veikkInit, veikkInit.size, 200)
+                }
+                for (i in 0 until targetIntf.endpointCount) {
+                    val ep = targetIntf.getEndpoint(i)
+                    if (ep.direction == UsbConstants.USB_DIR_OUT &&
+                        (ep.type == UsbConstants.USB_ENDPOINT_XFER_INT || ep.type == UsbConstants.USB_ENDPOINT_XFER_BULK)
+                    ) {
+                        runCatching { connection.bulkTransfer(ep, veikkInit, veikkInit.size, 150) }
+                    }
+                }
             }
         }
     }
@@ -818,7 +948,13 @@ class UsbTabletCoordinator(
     ): UsbInterface? {
         if (profile != null && profile.interfaceNumber < device.interfaceCount) {
             val candidate = device.getInterface(profile.interfaceNumber)
-            if (!isAdbOrNonInputInterface(candidate) && findInterruptInEndpoint(candidate, null) != null) {
+            val isBootMouseOrKbd = candidate.interfaceClass == UsbConstants.USB_CLASS_HID &&
+                candidate.interfaceSubclass == 1 &&
+                (candidate.interfaceProtocol == 1 || candidate.interfaceProtocol == 2)
+            if (!isAdbOrNonInputInterface(candidate) &&
+                !(kind == UsbPeripheralKind.TABLET && isBootMouseOrKbd) &&
+                findInterruptInEndpoint(candidate, null) != null
+            ) {
                 return candidate
             }
         }
@@ -886,6 +1022,9 @@ class UsbTabletCoordinator(
         val session = activeConnections.remove(deviceKey) ?: return
         session.running.set(false)
         session.threads.forEach { runCatching { it.interrupt() } }
+        runCatching {
+            com.example.hub.KodaAccessibilityService.activeInstance()?.cancelActiveStroke()
+        }
         if (activeVideoConnection == session.connection) {
             activeVideoConnection = null
             activeVideoBulkOutEndpoint = null
@@ -899,6 +1038,8 @@ class UsbTabletCoordinator(
 
     fun stopAllSessions() {
         activeConnections.keys.toList().forEach { stopDeviceSession(it) }
+        activeVideoConnection = null
+        activeVideoBulkOutEndpoint = null
     }
 
     /**

@@ -130,7 +130,7 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun forwardPointerToCursorOverlay(ev: MotionEvent) {
-        if (ev.device?.isVirtual == true) return
+        if (ev.deviceId <= 0 || ev.device?.isVirtual == true) return
         val tool = if (ev.pointerCount > 0) ev.getToolType(0) else MotionEvent.TOOL_TYPE_UNKNOWN
         val isStylus = tool == MotionEvent.TOOL_TYPE_STYLUS ||
             tool == MotionEvent.TOOL_TYPE_ERASER ||
@@ -423,8 +423,16 @@ fun KodaWintabRoot(
                     selectedSlot = selectedSlot,
                     tabletConfig = tabletConfig,
                     availableProfiles = availableProfiles,
-                    telemetryFlow = viewModel.telemetryMesa1,
-                    hexFramesFlow = viewModel.hexFrames,
+                    telemetryFlow = if (selectedSlot == com.example.driver.TabletSlotId.MESA_2) {
+                        viewModel.telemetryMesa2
+                    } else {
+                        viewModel.telemetryMesa1
+                    },
+                    hexFramesFlow = if (selectedSlot == com.example.driver.TabletSlotId.MESA_2) {
+                        viewModel.hexFramesMesa2
+                    } else {
+                        viewModel.hexFrames
+                    },
                     displays = displays,
                     installedApps = installedApps,
                     connectedTabletCount = usbDevices.count { it.kind == UsbPeripheralKind.TABLET },

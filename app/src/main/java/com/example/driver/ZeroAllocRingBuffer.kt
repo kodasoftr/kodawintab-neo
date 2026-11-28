@@ -17,21 +17,24 @@ class ZeroAllocRingBuffer(
     private val writeIdx = AtomicLong(0L)
     private val readIdx = AtomicLong(0L)
     private val droppedCount = AtomicLong(0L)
+    private val offerLock = Any()
 
     fun offer(source: ByteArray, length: Int, timestampNs: Long): Boolean {
-        val w = writeIdx.get()
-        val r = readIdx.get()
-        if (w - r >= capacity) {
-            droppedCount.incrementAndGet()
-            return false
+        synchronized(offerLock) {
+            val w = writeIdx.get()
+            val r = readIdx.get()
+            if (w - r >= capacity) {
+                droppedCount.incrementAndGet()
+                return false
+            }
+            val slotIndex = (w % capacity).toInt()
+            val copyLen = length.coerceIn(0, packetSize)
+            System.arraycopy(source, 0, slots[slotIndex], 0, copyLen)
+            lengths[slotIndex] = copyLen
+            timestampsNs[slotIndex] = timestampNs
+            writeIdx.set(w + 1)
+            return true
         }
-        val slotIndex = (w % capacity).toInt()
-        val copyLen = length.coerceIn(0, packetSize)
-        System.arraycopy(source, 0, slots[slotIndex], 0, copyLen)
-        lengths[slotIndex] = copyLen
-        timestampsNs[slotIndex] = timestampNs
-        writeIdx.lazySet(w + 1)
-        return true
     }
 
     fun poll(dest: ByteArray, outMeta: LongArray): Int {
@@ -42,13 +45,18 @@ class ZeroAllocRingBuffer(
         val len = lengths[slotIndex]
         System.arraycopy(slots[slotIndex], 0, dest, 0, len)
         outMeta[0] = timestampsNs[slotIndex]
-        readIdx.lazySet(r + 1)
+        readIdx.set(r + 1)
         return len
     }
 
     fun getDroppedCount(): Long = droppedCount.get()
 
     fun clear() {
-        readIdx.set(writeIdx.get())
+        while (true) {
+            val r = readIdx.get()
+            val w = writeIdx.get()
+            if (r >= w) break
+            if (readIdx.compareAndSet(r, w)) break
+        }
     }
 }

@@ -44,7 +44,9 @@ class MouseHidParser {
             val b2 = packet[offset + 2].toInt()
             val b3 = packet[offset + 3].toInt()
             val b4 = packet[offset + 4].toInt()
-            val likely16Bit = (b2 == 0 || b2 == -1) && (b4 == 0 || b4 == -1)
+            val xSignOk = (b2 == 0 && b1 >= 0) || (b2 == -1 && b1 < 0)
+            val ySignOk = (b4 == 0 && b3 >= 0) || (b4 == -1 && b3 < 0)
+            val likely16Bit = rem >= 6 && xSignOk && ySignOk && (b2 != 0 || b4 != 0 || b3 != 0)
             if (likely16Bit) {
                 dx = ((b2 shl 8) or (b1 and 0xFF)).toShort().toInt()
                 dy = ((b4 shl 8) or (b3 and 0xFF)).toShort().toInt()

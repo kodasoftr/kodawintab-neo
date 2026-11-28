@@ -39,6 +39,7 @@ class KodaHubForegroundService : Service() {
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private val mainHandler = Handler(Looper.getMainLooper())
     private var isPaused = false
+    private var terminatingProcess = false
 
     override fun onCreate() {
         super.onCreate()
@@ -139,9 +140,11 @@ class KodaHubForegroundService : Service() {
             runCatching { app.stopGlobalPointerStream() }
         } else {
             runCatching { app.pipelineMesa1.start() }
+            runCatching { app.pipelineMesa2.start() }
             runCatching { app.cursorOverlayManager.setPaused(false) }
             runCatching { app.hubManager.startCoopMonitor(app.coopMonitorScope) }
             runCatching { app.startGlobalPointerStream() }
+            runCatching { app.usbCoordinator.refreshConnectedDevices() }
         }
         val nm = getSystemService(NotificationManager::class.java)
         nm?.notify(NOTIFICATION_ID, buildNotification(paused = isPaused))
@@ -149,6 +152,7 @@ class KodaHubForegroundService : Service() {
 
     private fun performCompleteShutdown() {
         // Force-stop ONLY the app UI/service/pipelines while keeping permanent ADB Shell Server & permissions untouched!
+        terminatingProcess = true
         setUserTerminatedFlag(this, true)
         val app = application as? KodaWintabApp
         runCatching { app?.stopGlobalPointerStream() }
@@ -183,6 +187,9 @@ class KodaHubForegroundService : Service() {
     }
 
     override fun onDestroy() {
+        if (!terminatingProcess) {
+            mainHandler.removeCallbacksAndMessages(null)
+        }
         val app = application as? KodaWintabApp
         runCatching { app?.stopGlobalPointerStream() }
         runCatching { app?.pipelineMesa1?.stop() }

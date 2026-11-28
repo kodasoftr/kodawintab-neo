@@ -57,13 +57,16 @@ class TabletProfileRepository(private val context: Context) {
 
     fun findByVidPid(vendorId: Int, productId: Int, productName: String = ""): TabletProfileJson? {
         val all = getAllProfiles()
-        val exact = all.firstOrNull { it.vendorId == vendorId && productId in it.productIds }
-        if (exact != null) return exact
         val lower = productName.lowercase()
-        if (PEN_DISPLAY_NAME_HINTS.any { lower.contains(it) }) {
+        val looksLikePenDisplay = PEN_DISPLAY_NAME_HINTS.any { lower.contains(it) }
+        if (looksLikePenDisplay) {
+            val displayExact = all.firstOrNull { it.isPenDisplay && it.vendorId == vendorId && productId in it.productIds }
+            if (displayExact != null) return displayExact
             val displayByBrand = all.firstOrNull { it.isPenDisplay && it.vendorId == vendorId }
             if (displayByBrand != null) return displayByBrand
         }
+        val exact = all.firstOrNull { it.vendorId == vendorId && productId in it.productIds }
+        if (exact != null) return exact
         return all.firstOrNull { !it.isPenDisplay && it.vendorId == vendorId }
             ?: all.firstOrNull { it.vendorId == vendorId }
     }
@@ -99,25 +102,48 @@ class TabletProfileRepository(private val context: Context) {
         profile: TabletProfileJson,
         rawDescriptors: ByteArray? = null
     ): HidReportParser {
-        val layout = HidDescriptorDecoder.decode(rawDescriptors).copy(
-            logicalMaxX = profile.maxX.coerceAtLeast(1024),
-            logicalMaxY = profile.maxY.coerceAtLeast(1024),
-            logicalMaxPressure = profile.maxPressure.coerceAtLeast(1024)
+        val decoded = HidDescriptorDecoder.decode(rawDescriptors)
+        val useDecodedBounds = rawDescriptors != null &&
+            (decoded.hasDigitizerUsagePage || profile.id == "generic_hid")
+        val effMaxX = if (useDecodedBounds && decoded.logicalMaxX > profile.maxX) {
+            decoded.logicalMaxX
+        } else {
+            profile.maxX.coerceAtLeast(1024)
+        }
+        val effMaxY = if (useDecodedBounds && decoded.logicalMaxY > profile.maxY) {
+            decoded.logicalMaxY
+        } else {
+            profile.maxY.coerceAtLeast(1024)
+        }
+        val effMaxP = if (useDecodedBounds && decoded.logicalMaxPressure > profile.maxPressure) {
+            decoded.logicalMaxPressure
+        } else {
+            profile.maxPressure.coerceAtLeast(1024)
+        }
+
+        val layout = decoded.copy(
+            logicalMaxX = effMaxX,
+            logicalMaxY = effMaxY,
+            logicalMaxPressure = effMaxP
         )
         val generic = GenericHidDigitizerParser(layout)
-        val ugee = UgeeS640Parser(profile.maxX, profile.maxY, profile.maxPressure)
-        val huion = HuionParser(profile.maxX, profile.maxY, profile.maxPressure)
-        val wacom = WacomParser(profile.maxX, profile.maxY, profile.maxPressure)
+        val ugee = UgeeS640Parser(effMaxX, effMaxY, effMaxP)
+        val huion = HuionParser(effMaxX, effMaxY, effMaxP, bit5IsEraser = true, brand = TabletBrand.HUION)
+        val ucLogic = HuionParser(effMaxX, effMaxY, effMaxP, bit5IsEraser = false, brand = TabletBrand.UCLOGIC)
+        val veikk = VeikkParser(effMaxX, effMaxY, effMaxP)
+        val wacom = WacomParser(effMaxX, effMaxY, effMaxP)
 
         return when (runCatching { ParserType.valueOf(profile.parserType) }.getOrNull()) {
-            ParserType.UGEE_S640 -> ResilientTabletParser(ugee, listOf(huion, wacom, generic))
-            ParserType.WACOM -> ResilientTabletParser(wacom, listOf(ugee, huion, generic))
-            ParserType.HUION -> ResilientTabletParser(huion, listOf(ugee, wacom, generic))
+            ParserType.UGEE_S640 -> ResilientTabletParser(ugee, listOf(huion, veikk, wacom, generic))
+            ParserType.WACOM -> ResilientTabletParser(wacom, listOf(ugee, huion, veikk, generic))
+            ParserType.HUION -> ResilientTabletParser(huion, listOf(ucLogic, ugee, veikk, wacom, generic))
+            ParserType.UCLOGIC -> ResilientTabletParser(ucLogic, listOf(huion, ugee, veikk, wacom, generic))
+            ParserType.VEIKK -> ResilientTabletParser(veikk, listOf(ugee, ucLogic, huion, wacom, generic))
             ParserType.XP_PEN -> ResilientTabletParser(
-                XpPenParser(profile.maxX, profile.maxY, profile.maxPressure),
-                listOf(huion, wacom, generic)
+                XpPenParser(effMaxX, effMaxY, effMaxP),
+                listOf(ucLogic, huion, veikk, wacom, generic)
             )
-            else -> ResilientTabletParser(generic, listOf(ugee, huion, wacom))
+            else -> ResilientTabletParser(generic, listOf(ugee, ucLogic, huion, veikk, wacom))
         }
     }
 

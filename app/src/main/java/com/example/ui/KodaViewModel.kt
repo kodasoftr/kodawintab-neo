@@ -80,6 +80,7 @@ class KodaViewModel(application: Application) : AndroidViewModel(application) {
     val telemetryMesa1: StateFlow<DriverTelemetry> = pipeline1.telemetry
     val telemetryMesa2: StateFlow<DriverTelemetry> = pipeline2.telemetry
     val hexFrames: StateFlow<List<HidHexFrame>> = pipeline1.hexFrames
+    val hexFramesMesa2: StateFlow<List<HidHexFrame>> = pipeline2.hexFrames
 
     private val _statusToast = MutableStateFlow<String?>(null)
     val statusToast: StateFlow<String?> = _statusToast.asStateFlow()
@@ -90,7 +91,8 @@ class KodaViewModel(application: Application) : AndroidViewModel(application) {
     private val _batteryUnrestricted = MutableStateFlow(checkBatteryIgnoringOptimizations())
     val batteryUnrestricted: StateFlow<Boolean> = _batteryUnrestricted.asStateFlow()
 
-    private var saveConfigJob: Job? = null
+    private val saveConfigJobs = mutableMapOf<TabletSlotId, Job>()
+    private var selectSlotJob: Job? = null
 
     init {
         engineClient.syncPermanentActivationFromPrefs()
@@ -323,10 +325,13 @@ class KodaViewModel(application: Application) : AndroidViewModel(application) {
 
     fun selectTabletSlot(slotId: TabletSlotId) {
         _selectedSlot.value = slotId
-        viewModelScope.launch {
+        selectSlotJob?.cancel()
+        selectSlotJob = viewModelScope.launch {
             val loaded = profileRepo.loadConfig(slotId)
-            _tabletConfig.value = loaded
-            applyPipelineConfig(loaded, displayRotationDeg.value)
+            if (_selectedSlot.value == slotId) {
+                _tabletConfig.value = loaded
+                applyPipelineConfig(loaded, displayRotationDeg.value)
+            }
         }
     }
 
@@ -334,8 +339,8 @@ class KodaViewModel(application: Application) : AndroidViewModel(application) {
         val updated = transform(_tabletConfig.value)
         _tabletConfig.value = updated
         applyPipelineConfig(updated, displayRotationDeg.value)
-        saveConfigJob?.cancel()
-        saveConfigJob = viewModelScope.launch(Dispatchers.IO) {
+        saveConfigJobs[updated.slotId]?.cancel()
+        saveConfigJobs[updated.slotId] = viewModelScope.launch(Dispatchers.IO) {
             delay(180L)
             profileRepo.saveConfig(updated)
         }
@@ -352,12 +357,19 @@ class KodaViewModel(application: Application) : AndroidViewModel(application) {
 
     fun updatePressurePoint(index: Int, inputNorm: Float, outputNorm: Float) {
         updateTabletConfig { cfg ->
-            val mutable = cfg.pressureCurve.toMutableList()
+            val mutable = cfg.pressureCurve.sortedBy { it.inputNorm }.toMutableList()
             if (index in mutable.indices) {
-                val clampedX = if (index == 0) 0f else if (index == mutable.lastIndex) 1f else {
-                    inputNorm.coerceIn(mutable[index - 1].inputNorm + 0.04f, mutable[index + 1].inputNorm - 0.04f)
+                val clampedX = when (index) {
+                    0 -> 0f
+                    mutable.lastIndex -> 1f
+                    else -> {
+                        val minX = mutable[index - 1].inputNorm + 0.04f
+                        val maxX = (mutable[index + 1].inputNorm - 0.04f).coerceAtLeast(minX)
+                        inputNorm.coerceIn(minX, maxX)
+                    }
                 }
                 mutable[index] = PressureControlPoint(clampedX, outputNorm.coerceIn(0f, 1f))
+                mutable.sortBy { it.inputNorm }
             }
             cfg.copy(pressureCurve = mutable)
         }

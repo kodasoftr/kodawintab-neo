@@ -5,6 +5,16 @@ import android.app.Application
 import android.content.ComponentCallbacks2
 import android.content.res.Configuration
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
+import android.os.SystemClock
+import android.view.InputDevice
+import android.view.KeyEvent
+import android.view.MotionEvent
+import java.lang.ref.WeakReference
+import kotlin.math.PI
+import kotlin.math.atan2
+import kotlin.math.hypot
 import com.example.display.DisplayTargetManager
 import com.example.display.TargetDisplayInfo
 import com.example.driver.TabletPipeline
@@ -40,6 +50,10 @@ class KodaWintabApp : Application() {
     private val startedActivities = HashSet<Int>()
     @Volatile var isAppInForeground: Boolean = false
         private set
+    @Volatile private var foregroundActivityRef: WeakReference<Activity>? = null
+    private val mainHandler = Handler(Looper.getMainLooper())
+    private val inAppTouchLock = Any()
+    private var inAppDownTimeMs = 0L
 
     lateinit var engineClient: KodaEngineClient
         private set
@@ -91,8 +105,14 @@ class KodaWintabApp : Application() {
                 }
             }
             override fun onActivityCreated(activity: Activity, savedInstanceState: Bundle?) = Unit
-            override fun onActivityResumed(activity: Activity) = Unit
-            override fun onActivityPaused(activity: Activity) = Unit
+            override fun onActivityResumed(activity: Activity) {
+                foregroundActivityRef = WeakReference(activity)
+            }
+            override fun onActivityPaused(activity: Activity) {
+                if (foregroundActivityRef?.get() === activity) {
+                    foregroundActivityRef = null
+                }
+            }
             override fun onActivitySaveInstanceState(activity: Activity, outState: Bundle) = Unit
             override fun onActivityDestroyed(activity: Activity) = Unit
         })
@@ -138,36 +158,73 @@ class KodaWintabApp : Application() {
             pipelineMesa1 = pipelineMesa1,
             engineClient = engineClient,
             installedAppsProvider = { hubManager.installedApps.value }
-        )
-        pipelineMesa1.onCursorCoordinate = { x, y, visible, fromTablet ->
-            cursorOverlayManager.updateCursorPosition(x, y, visible, fromTablet, channel = 1)
+        ).apply {
+            onResetToPrimaryDisplay = {
+                syncDisplayStateEverywhere(displayManager.getDisplayOrDefault(0))
+            }
+        }
+        val inAppStylusDispatcher: (Long, Int, Float, Float, Float, Float, Float, Boolean, Int) -> Unit =
+            { eventTimeMs, action, x, y, pressure, tiltXDeg, tiltYDeg, isEraser, buttonState ->
+                dispatchInAppStylusMotionEvent(
+                    eventTimeMs = eventTimeMs,
+                    action = action,
+                    screenX = x,
+                    screenY = y,
+                    pressure = pressure,
+                    tiltXDeg = tiltXDeg,
+                    tiltYDeg = tiltYDeg,
+                    isEraser = isEraser,
+                    buttonState = buttonState
+                )
+            }
+        val inAppKeyDispatcher: (Int, Int, Int) -> Unit = { action, keyCode, metaState ->
+            dispatchInAppKeyEvent(action, keyCode, metaState)
+        }
+        pipelineMesa1.onInAppStylusEvent = inAppStylusDispatcher
+        pipelineMesa1.onInAppKeyEvent = inAppKeyDispatcher
+        pipelineMesa2.onInAppStylusEvent = inAppStylusDispatcher
+        pipelineMesa2.onInAppKeyEvent = inAppKeyDispatcher
+
+        pipelineMesa1.onStylusSample = { x, y, pressure, isTipDown, tiltX, tiltY ->
             val pdState = penDisplayManager.state.value
             if (pdState.isVirtualDisplayActive && pdState.selectedPreset.widthPx > 0 && pdState.selectedPreset.heightPx > 0) {
-                val tel = pipelineMesa1.telemetry.value
+                val tgtId = pipelineMesa1.config.targetDisplayId
+                val sameDisplay = tgtId == pdState.virtualDisplayId
+                val refW: Float
+                val refH: Float
+                if (sameDisplay) {
+                    refW = pdState.selectedPreset.widthPx.toFloat()
+                    refH = pdState.selectedPreset.heightPx.toFloat()
+                } else {
+                    val disp = displayManager.getDisplayOrDefault(tgtId)
+                    refW = disp.widthPx.coerceAtLeast(1).toFloat()
+                    refH = disp.heightPx.coerceAtLeast(1).toFloat()
+                }
                 penDisplayManager.dispatchStylusInputToPenDisplay(
-                    normX = x / pdState.selectedPreset.widthPx.toFloat(),
-                    normY = y / pdState.selectedPreset.heightPx.toFloat(),
-                    pressureNorm = tel.lastCurvedPressure,
-                    isTipDown = tel.isTipDown,
-                    tiltX = tel.lastTiltX,
-                    tiltY = tel.lastTiltY,
-                    injectSystemEvent = pipelineMesa1.config.targetDisplayId != pdState.virtualDisplayId
+                    normX = x / refW,
+                    normY = y / refH,
+                    pressureNorm = pressure,
+                    isTipDown = isTipDown,
+                    tiltX = tiltX,
+                    tiltY = tiltY,
+                    injectSystemEvent = !sameDisplay
                 )
             }
         }
-        usbCoordinator.onTabletProfileConnected = { slot, profile ->
+        usbCoordinator.onTabletProfileConnected = { slot, profile, rawDescriptors ->
             val targetDisplayId = if (slot == com.example.driver.TabletSlotId.MESA_2) {
                 pipelineMesa2.config.targetDisplayId
             } else {
                 pipelineMesa1.config.targetDisplayId
             }
             val disp = displayManager.getDisplayOrDefault(targetDisplayId)
+            val resolvedParser = profileRepository.createParserFor(profile, rawDescriptors)
             if (slot == com.example.driver.TabletSlotId.MESA_2) {
                 val updatedCfg = pipelineMesa2.config.copy(profileId = profile.id)
                 pipelineMesa2.updateConfiguration(
                     newConfig = updatedCfg,
                     profile = profile,
-                    parser = profileRepository.createParserFor(profile),
+                    parser = resolvedParser,
                     displayWidth = disp.widthPx.toFloat(),
                     displayHeight = disp.heightPx.toFloat(),
                     displayRotationDeg = disp.rotationDeg,
@@ -179,7 +236,7 @@ class KodaWintabApp : Application() {
                 pipelineMesa1.updateConfiguration(
                     newConfig = updatedCfg,
                     profile = profile,
-                    parser = profileRepository.createParserFor(profile),
+                    parser = resolvedParser,
                     displayWidth = disp.widthPx.toFloat(),
                     displayHeight = disp.heightPx.toFloat(),
                     displayRotationDeg = disp.rotationDeg,
@@ -191,6 +248,9 @@ class KodaWintabApp : Application() {
         }
         usbCoordinator.resolveCursorChannel = { key ->
             hubManager.resolveChannelForDeviceKey(key)
+        }
+        usbCoordinator.resolveTabletSlot = { key ->
+            hubManager.resolveTabletSlotForDeviceKey(key)
         }
         usbCoordinator.onMouseCoordinate = { x, y, visible, channel ->
             cursorOverlayManager.updateCursorPosition(x, y, visible, fromTablet = false, channel = channel, directSource = true)
@@ -324,7 +384,7 @@ class KodaWintabApp : Application() {
                 if (!isAppInForeground && !hasDirectUsbFeed && hasAnyCursor && !snap.isPaused) {
                     val sample = engineClient.pollGlobalPointer()
                     if (sample != null) {
-                        val disp = displayManager.getDisplayOrDefault(0)
+                        val disp = displayManager.getDisplayOrDefault(pipelineMesa1.config.targetDisplayId)
                         cursorOverlayManager.applyGlobalPointerSample(
                             sample = sample,
                             displayWidthPx = disp.widthPx.toFloat(),
@@ -371,6 +431,136 @@ class KodaWintabApp : Application() {
                 .putString("last_crash_detail", throwable.stackTraceToString().take(600))
                 .commit()
             defaultHandler?.uncaughtException(thread, throwable)
+        }
+    }
+
+    private fun dispatchInAppStylusMotionEvent(
+        eventTimeMs: Long,
+        action: Int,
+        screenX: Float,
+        screenY: Float,
+        pressure: Float,
+        tiltXDeg: Float,
+        tiltYDeg: Float,
+        isEraser: Boolean,
+        buttonState: Int
+    ) {
+        if (!isAppInForeground) return
+        val activity = foregroundActivityRef?.get() ?: return
+        if (activity.isFinishing || activity.isDestroyed) return
+
+        mainHandler.post {
+            val decor = activity.window?.decorView ?: return@post
+            val loc = IntArray(2)
+            decor.getLocationOnScreen(loc)
+            val localX = screenX - loc[0].toFloat()
+            val localY = screenY - loc[1].toFloat()
+
+            val props = arrayOf(MotionEvent.PointerProperties().apply {
+                id = 0
+                toolType = if (isEraser) MotionEvent.TOOL_TYPE_ERASER else MotionEvent.TOOL_TYPE_STYLUS
+            })
+            val tiltRad = (hypot(tiltXDeg, tiltYDeg) * (PI / 180.0)).toFloat().coerceIn(0f, (PI / 2.0).toFloat())
+            val orientationRad = if (tiltRad > 0.002f) atan2(tiltXDeg, -tiltYDeg) else 0f
+            val isTouchAction = action == MotionEvent.ACTION_DOWN || action == MotionEvent.ACTION_MOVE
+            val effP = when {
+                action == MotionEvent.ACTION_DOWN -> pressure.coerceAtLeast(0.02f)
+                isTouchAction -> pressure.coerceAtLeast(0.005f)
+                else -> 0f
+            }
+            val contactSpan = if (effP > 0f) 4f + effP * 24f else 0f
+            val coords = arrayOf(MotionEvent.PointerCoords().apply {
+                x = localX
+                y = localY
+                this.pressure = effP
+                setAxisValue(MotionEvent.AXIS_PRESSURE, effP)
+                size = if (effP > 0f) (0.04f + effP * 0.96f) else 0f
+                touchMajor = contactSpan
+                touchMinor = contactSpan
+                toolMajor = contactSpan
+                toolMinor = contactSpan
+                orientation = orientationRad
+                setAxisValue(MotionEvent.AXIS_TILT, tiltRad)
+                setAxisValue(MotionEvent.AXIS_ORIENTATION, orientationRad)
+                setAxisValue(MotionEvent.AXIS_DISTANCE, if (isTouchAction || action == MotionEvent.ACTION_UP) 0f else 1f)
+            })
+
+            synchronized(inAppTouchLock) {
+                when (action) {
+                    MotionEvent.ACTION_DOWN -> {
+                        if (inAppDownTimeMs > 0L) {
+                            val cancelEv = MotionEvent.obtain(
+                                inAppDownTimeMs, maxOf(eventTimeMs, inAppDownTimeMs),
+                                MotionEvent.ACTION_CANCEL, 1, props, coords,
+                                0, 0, 1f, 1f, -1, 0,
+                                InputDevice.SOURCE_STYLUS or InputDevice.SOURCE_TOUCHSCREEN, 0
+                            )
+                            decor.dispatchTouchEvent(cancelEv)
+                            cancelEv.recycle()
+                        }
+                        inAppDownTimeMs = eventTimeMs
+                        val downEv = MotionEvent.obtain(
+                            eventTimeMs, eventTimeMs, MotionEvent.ACTION_DOWN,
+                            1, props, coords, 0, buttonState, 1f, 1f, -1, 0,
+                            InputDevice.SOURCE_STYLUS or InputDevice.SOURCE_TOUCHSCREEN, 0
+                        )
+                        decor.dispatchTouchEvent(downEv)
+                        downEv.recycle()
+                    }
+                    MotionEvent.ACTION_MOVE -> {
+                        if (inAppDownTimeMs == 0L) {
+                            inAppDownTimeMs = eventTimeMs
+                            val synthDown = MotionEvent.obtain(
+                                eventTimeMs, eventTimeMs, MotionEvent.ACTION_DOWN,
+                                1, props, coords, 0, buttonState, 1f, 1f, -1, 0,
+                                InputDevice.SOURCE_STYLUS or InputDevice.SOURCE_TOUCHSCREEN, 0
+                            )
+                            decor.dispatchTouchEvent(synthDown)
+                            synthDown.recycle()
+                        }
+                        val moveEv = MotionEvent.obtain(
+                            inAppDownTimeMs, maxOf(eventTimeMs, inAppDownTimeMs), MotionEvent.ACTION_MOVE,
+                            1, props, coords, 0, buttonState, 1f, 1f, -1, 0,
+                            InputDevice.SOURCE_STYLUS or InputDevice.SOURCE_TOUCHSCREEN, 0
+                        )
+                        decor.dispatchTouchEvent(moveEv)
+                        moveEv.recycle()
+                    }
+                    MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                        val dt = inAppDownTimeMs
+                        inAppDownTimeMs = 0L
+                        if (dt > 0L) {
+                            val upEv = MotionEvent.obtain(
+                                dt, maxOf(eventTimeMs, dt), action,
+                                1, props, coords, 0, buttonState, 1f, 1f, -1, 0,
+                                InputDevice.SOURCE_STYLUS or InputDevice.SOURCE_TOUCHSCREEN, 0
+                            )
+                            decor.dispatchTouchEvent(upEv)
+                            upEv.recycle()
+                        }
+                    }
+                    else -> {
+                        val hoverEv = MotionEvent.obtain(
+                            eventTimeMs, eventTimeMs, action,
+                            1, props, coords, 0, buttonState, 1f, 1f, -1, 0,
+                            InputDevice.SOURCE_STYLUS, 0
+                        )
+                        decor.dispatchGenericMotionEvent(hoverEv)
+                        hoverEv.recycle()
+                    }
+                }
+            }
+        }
+    }
+
+    private fun dispatchInAppKeyEvent(action: Int, keyCode: Int, metaState: Int) {
+        if (!isAppInForeground) return
+        val activity = foregroundActivityRef?.get() ?: return
+        if (activity.isFinishing || activity.isDestroyed) return
+        mainHandler.post {
+            val now = SystemClock.uptimeMillis()
+            val ev = KeyEvent(now, now, action, keyCode, 0, metaState, -1, 0, 0, InputDevice.SOURCE_KEYBOARD)
+            activity.dispatchKeyEvent(ev)
         }
     }
 
